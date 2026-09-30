@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wikidata Bot - Unlimited Automation & Live Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --card: rgba(22, 30, 49, 0.75);
+            --border: rgba(255, 255, 255, 0.08);
+            --primary: #6366f1;
+            --primary-glow: rgba(99, 102, 241, 0.35);
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --text: #f3f4f6;
+            --muted: #9ca3af;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 2rem;
+            background-image: 
+                radial-gradient(circle at 10% 10%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
+                radial-gradient(circle at 90% 90%, rgba(16, 185, 129, 0.12) 0%, transparent 40%);
+        }
+
+        .container { max-width: 1280px; margin: 0 auto; }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1.2rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .brand { display: flex; align-items: center; gap: 1rem; }
+        .logo {
+            width: 48px; height: 48px;
+            background: linear-gradient(135deg, var(--primary), var(--success));
+            border-radius: 14px;
+            display: grid; place-items: center;
+            font-weight: 700; font-size: 1.5rem;
+            box-shadow: 0 0 24px var(--primary-glow);
+        }
+
+        .controls { display: flex; gap: 0.8rem; align-items: center; }
+        .btn {
+            padding: 0.6rem 1.4rem;
+            border-radius: 10px;
+            border: none;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex; align-items: center; gap: 0.5rem;
+        }
+        .btn-success { background: var(--success); color: #fff; box-shadow: 0 0 15px rgba(16, 185, 129, 0.3); }
+        .btn-warning { background: var(--warning); color: #fff; }
+        .btn-danger { background: var(--danger); color: #fff; }
+        .btn:hover { opacity: 0.9; transform: translateY(-1px); }
+
+        .status-pill {
+            padding: 0.5rem 1.2rem;
+            border-radius: 99px;
+            font-weight: 600; font-size: 0.85rem;
+            display: flex; align-items: center; gap: 0.6rem;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border);
+        }
+
+        .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+        .dot.RUNNING { background: var(--success); box-shadow: 0 0 12px var(--success); animation: pulse 2s infinite; }
+        .dot.PAUSED { background: var(--warning); }
+        .dot.STOPPED { background: var(--danger); }
+
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .metric-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.4rem;
+            backdrop-filter: blur(12px);
+        }
+        .metric-title { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+        .metric-num { font-size: 2rem; font-weight: 700; margin-top: 0.4rem; }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            backdrop-filter: blur(12px);
+        }
+
+        .table-wrapper {
+            margin-top: 1rem;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+        }
+
+        th, td {
+            padding: 0.85rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        th { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+
+        .qid-link {
+            font-family: 'JetBrains Mono', monospace;
+            color: #38bdf8;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .qid-link:hover { text-decoration: underline; }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 99px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .badge.SUCCESS { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+        .badge.SKIPPED { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+        .badge.ERROR { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+        .badge.WARNING { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+
+        .empty-state { text-align: center; padding: 2rem; color: var(--muted); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="brand">
+                <div class="logo">W</div>
+                <div>
+                    <h2>Wikidata Bot Control Center</h2>
+                    <p style="font-size: 0.85rem; color: var(--muted);">Unlimited Regional Edit Automation & Live Monitor (Bengali & Hindi)</p>
+                </div>
+            </div>
+
+            <div class="controls">
+                <div class="status-pill">
+                    <div class="dot" id="statusDot"></div>
+                    <span id="statusText">STOPPED</span>
+                </div>
+                <button class="btn btn-success" onclick="controlBot('start')">▶ Start Bot</button>
+                <button class="btn btn-warning" onclick="controlBot('pause')">⏸ Pause</button>
+                <button class="btn btn-danger" onclick="controlBot('stop')">⏹ Stop</button>
+            </div>
+        </header>
+
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-title">Total Edits Submitted</div>
+                <div class="metric-num" id="valEdits" style="color: var(--success);">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Skipped (Already Present)</div>
+                <div class="metric-num" id="valSkipped" style="color: #60a5fa;">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Failed / Errors</div>
+                <div class="metric-num" id="valFailed" style="color: var(--danger);">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Total Saved State QIDs</div>
+                <div class="metric-num" id="valCompleted">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Uptime</div>
+                <div class="metric-num" id="valUptime" style="font-family: 'JetBrains Mono';">00:00:00</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>📡 Real-Time Edit Stream</h3>
+                <span style="font-size: 0.85rem; color: var(--muted);" id="currentQidText">Current QID: -</span>
+            </div>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Wikidata QID</th>
+                            <th>Action / Target</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="feedTable">
+                        <tr>
+                            <td colspan="4" class="empty-state">Waiting for live bot stream data...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function updateStats() {
+            fetch('/api/stats')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('valEdits').innerText = data.total_edits;
+                    document.getElementById('valSkipped').innerText = data.skipped_count;
+                    document.getElementById('valFailed').innerText = data.failed_count;
+                    document.getElementById('valCompleted').innerText = data.completed_count;
+                    document.getElementById('valUptime').innerText = data.uptime;
+
+                    const dot = document.getElementById('statusDot');
+                    const txt = document.getElementById('statusText');
+
+                    dot.className = 'dot ' + data.status;
+                    txt.innerText = data.status;
+
+                    if (data.current_qid) {
+                        document.getElementById('currentQidText').innerText = 'Processing QID: ' + data.current_qid;
+                    } else {
+                        document.getElementById('currentQidText').innerText = 'Current QID: -';
+                    }
+                });
+        }
+
+        function updateFeed() {
+            fetch('/api/feed')
+                .then(res => res.json())
+                .then(items => {
+                    const tbody = document.getElementById('feedTable');
+                    if (!items || items.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No edits recorded yet. Click "Start Bot" to launch.</td></tr>';
+                        return;
+                    }
+
+                    tbody.innerHTML = '';
+                    items.forEach(item => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td style="color: var(--muted); font-size: 0.85rem;">${item.timestamp}</td>
+                            <td><a class="qid-link" href="${item.qid_url}" target="_blank">${item.qid}</a></td>
+                            <td>${escapeHtml(item.action)}</td>
+                            <td><span class="badge ${item.status}">${item.status}</span></td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                });
+        }
+
+        function controlBot(action) {
+            fetch('/api/control/' + action, { method: 'POST' })
+                .then(res => res.json())
+                .then(res => {
+                    updateStats();
+                    updateFeed();
+                });
+        }
+
+        function escapeHtml(text) {
+            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }
+
+        setInterval(() => {
+            updateStats();
+            updateFeed();
+        }, 2000);
+
+        updateStats();
+        updateFeed();
+    </script>
+</body>
+</html>
