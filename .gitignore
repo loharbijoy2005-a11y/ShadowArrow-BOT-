@@ -1,0 +1,28 @@
+# Environment variables & secrets
+.env
+*.env
+
+# Python / Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Logs & State Files
+*.log
+processed_qids.txt
+processed_qids.json
+bot_state.sqlite
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
