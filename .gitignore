@@ -18,6 +18,7 @@ env/
 # Logs & State Files
 *.log
 processed_qids.txt
+completed_qids.txt
 processed_qids.json
 bot_state.sqlite
 
