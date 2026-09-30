@@ -18,7 +18,7 @@ BOT_USER = os.getenv("WIKIDATA_BOT_USER", "SHADOWARROW 2026@ShadowBot").strip()
 BOT_PASSWORD = os.getenv("WIKIDATA_BOT_PASSWORD", "").strip()
 
 USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026) python-requests"
-RATE_LIMIT_DELAY = 1.8  # 1.8 seconds delay between repairs
+RATE_LIMIT_DELAY = 6.0  # 6.0 seconds safe delay between repair edits
 EDIT_SUMMARY = "Auditing and fixing localized descriptions/labels"
 
 # Regex Guardrails
@@ -366,16 +366,37 @@ class WikidataCleanupRepairBot:
             "format": "json"
         }
 
-        time.sleep(RATE_LIMIT_DELAY)
-        write_res = self.session.post(API_URL, data=edit_params, timeout=30).json()
+        retries = 0
+        while retries < 5:
+            retries += 1
+            time.sleep(RATE_LIMIT_DELAY)
+            write_res = self.session.post(API_URL, data=edit_params, timeout=30).json()
 
-        if write_res.get("success") == 1:
-            logger.info(f"[FIXED] QID: {qid} | Replaced bad fields successfully ({', '.join(bad_fields)}).")
-            return True
-        else:
-            err_msg = write_res.get("error", {}).get("info", "Unknown error")
-            logger.error(f"[ERROR] Failed to repair QID {qid}: {err_msg}")
-            return False
+            if write_res.get("success") == 1:
+                logger.info(f"[FIXED] QID: {qid} | Replaced bad fields successfully ({', '.join(bad_fields)}).")
+                return True
+
+            err = write_res.get("error", {})
+            err_code = err.get("code", "")
+            err_info = err.get("info", "Unknown error")
+            messages = err.get("messages", [])
+
+            is_throttled = any("actionthrottledtext" in str(m) for m in messages)
+            if is_throttled:
+                logger.warning(f"[Rate Throttle] Wikimedia anti-abuse triggered on {qid}. Waiting 60s for bucket reset before retry {retries}/5...")
+                time.sleep(60.0)
+                continue
+
+            if err_code in ("badtoken", "notloggedin") and retries < 5:
+                logger.warning(f"[Auth] Token error on {qid}. Re-authenticating...")
+                self.login()
+                edit_params["token"] = self.csrf_token
+                continue
+
+            logger.error(f"[ERROR] Failed to repair QID {qid}: {err_info}")
+            break
+
+        return False
 
     def run(self):
         logger.info("==================================================")
