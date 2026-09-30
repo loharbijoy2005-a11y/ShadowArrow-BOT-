@@ -385,11 +385,67 @@ def generate_target_items() -> list:
         }
     ]
 
+def load_custom_items(file_path: str) -> list:
+    """Loads target edit records from a custom JSON or CSV file."""
+    path = Path(file_path)
+    if not path.exists():
+        logger.error(f"[Feeder] File not found: {file_path}")
+        return []
+
+    items = []
+    if path.suffix.lower() == ".json":
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for entry in data:
+                if "qid" in entry:
+                    items.append(entry)
+        logger.info(f"[Feeder] Loaded {len(items)} items from JSON file '{file_path}'.")
+    elif path.suffix.lower() == ".csv":
+        import csv
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                qid = row.get("qid") or row.get("QID")
+                if not qid:
+                    continue
+                labels = {}
+                descs = {}
+                for k, v in row.items():
+                    if not k or not v:
+                        continue
+                    k_lower = k.lower().strip()
+                    if k_lower.startswith("label_"):
+                        labels[k_lower.replace("label_", "")] = v.strip()
+                    elif k_lower.startswith("desc_"):
+                        descs[k_lower.replace("desc_", "")] = v.strip()
+                items.append({
+                    "qid": qid,
+                    "labels": labels,
+                    "descriptions": descs,
+                    "summary": row.get("summary", "Adding missing regional label/description via automated bot")
+                })
+        logger.info(f"[Feeder] Loaded {len(items)} items from CSV file '{file_path}'.")
+    return items
+
 def main():
     logger.info("==========================================================")
     logger.info(" Starting Wikidata Regional Label & Description Bot ")
     logger.info(" Target Languages: Bengali ('bn') & Hindi ('hi') ")
     logger.info("==========================================================")
+
+    # Check if a custom input file was passed via CLI
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        input_file = sys.argv[1]
+        logger.info(f"[Feeder] Loading target items from: '{input_file}'")
+        items = load_custom_items(input_file)
+    else:
+        logger.info("[Feeder] Loading built-in default target items generator...")
+        items = generate_target_items()
+
+    if not items:
+        logger.error("[Feeder] No items to process. Exiting.")
+        sys.exit(0)
 
     bot = WikidataBot()
 
@@ -400,11 +456,9 @@ def main():
         logger.critical(f"[Fatal] Authentication failed: {e}")
         sys.exit(1)
 
-    # Step 2: Load Target Items Batch
-    items = generate_target_items()
     logger.info(f"[Target] Total items in queue: {len(items)}")
 
-    # Step 3: Run Continuous Execution Loop
+    # Step 2: Run Continuous Execution Loop
     processed_count = 0
     for item in items:
         if not bot.running:
