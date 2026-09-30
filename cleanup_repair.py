@@ -262,7 +262,8 @@ class WikidataCleanupRepairBot:
         params = {
             "action": "wbgetentities",
             "ids": qid,
-            "props": "labels|descriptions",
+            "props": "labels|descriptions|sitelinks",
+            "sitefilter": "bnwiki|hiwiki",
             "format": "json"
         }
         res = self.session.get(API_URL, params=params, timeout=30).json()
@@ -274,6 +275,7 @@ class WikidataCleanupRepairBot:
 
         labels = entity.get("labels", {})
         descriptions = entity.get("descriptions", {})
+        sitelinks = entity.get("sitelinks", {})
 
         en_label = labels.get("en", {}).get("value", "")
         en_desc = descriptions.get("en", {}).get("value", "")
@@ -291,20 +293,36 @@ class WikidataCleanupRepairBot:
         # 1. Inspect & Repair Hindi Label
         if hi_label_val and self.is_bad_value(hi_label_val, "hi"):
             bad_fields.append("hi label")
-            new_hi_label = transliterate_label(en_label, "hi")
-            if new_hi_label:
+            new_hi_label = None
+            hi_site = sitelinks.get("hiwiki", {}).get("title", "").strip()
+            if hi_site:
+                clean_hi = re.sub(r'\s*\([^)]*\)$', '', hi_site).strip()
+                if validate_script(clean_hi, "hi"):
+                    new_hi_label = clean_hi
+            if not new_hi_label and en_label:
+                new_hi_label = transliterate_label(en_label, "hi")
+
+            if new_hi_label and validate_script(new_hi_label, "hi"):
                 payload_labels["hi"] = {"language": "hi", "value": new_hi_label}
             else:
-                payload_labels["hi"] = {"language": "hi", "value": "", "remove": ""}
+                payload_labels["hi"] = {"language": "hi", "remove": ""}
 
         # 2. Inspect & Repair Bengali Label
         if bn_label_val and self.is_bad_value(bn_label_val, "bn"):
             bad_fields.append("bn label")
-            new_bn_label = transliterate_label(en_label, "bn")
-            if new_bn_label:
+            new_bn_label = None
+            bn_site = sitelinks.get("bnwiki", {}).get("title", "").strip()
+            if bn_site:
+                clean_bn = re.sub(r'\s*\([^)]*\)$', '', bn_site).strip()
+                if validate_script(clean_bn, "bn"):
+                    new_bn_label = clean_bn
+            if not new_bn_label and en_label:
+                new_bn_label = transliterate_label(en_label, "bn")
+
+            if new_bn_label and validate_script(new_bn_label, "bn"):
                 payload_labels["bn"] = {"language": "bn", "value": new_bn_label}
             else:
-                payload_labels["bn"] = {"language": "bn", "value": "", "remove": ""}
+                payload_labels["bn"] = {"language": "bn", "remove": ""}
 
         # 3. Parse state & generate proper localized descriptions if possible
         parsed_nlp = parse_english_description(en_desc)
@@ -319,7 +337,7 @@ class WikidataCleanupRepairBot:
             if correct_descs and "hi" in correct_descs:
                 payload_descriptions["hi"] = {"language": "hi", "value": correct_descs["hi"]}
             else:
-                payload_descriptions["hi"] = {"language": "hi", "value": "", "remove": ""}
+                payload_descriptions["hi"] = {"language": "hi", "remove": ""}
 
         # 5. Inspect & Repair Bengali Description
         if bn_desc_val and self.is_bad_value(bn_desc_val, "bn"):
@@ -327,7 +345,7 @@ class WikidataCleanupRepairBot:
             if correct_descs and "bn" in correct_descs:
                 payload_descriptions["bn"] = {"language": "bn", "value": correct_descs["bn"]}
             else:
-                payload_descriptions["bn"] = {"language": "bn", "value": "", "remove": ""}
+                payload_descriptions["bn"] = {"language": "bn", "remove": ""}
 
         if not bad_fields and not payload_labels and not payload_descriptions:
             logger.info(f"[AUDITED] QID: {qid} | Clean (No bad data detected).")
