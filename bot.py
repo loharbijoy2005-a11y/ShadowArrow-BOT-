@@ -1,35 +1,48 @@
 """
-Wikidata Automated Regional Edit Bot (Bengali 'bn' & Hindi 'hi')
-Full, self-contained production implementation with rate-limiting, 
-2-stage MediaWiki authentication, state persistence, and automatic resumption.
+High-Throughput Production Wikidata Bot (bot.py)
+Features:
+- Single Atomic Edit Call using `action=wbeditentity` (combines all missing fields per QID in 1 request)
+- Batch Fetching in chunks of 50 QIDs via `action=wbgetentities`
+- One-Time CSRF Token reuse per session
+- 1.8s Rate-limit delay & exponential backoff on maxlag/429
+- Dynamic State-to-Language NLP mapping (strict zero-guesswork)
+- Strictly neutral edit summary: 'Added missing Hindi and Bengali labels and descriptions'
+- Resumability via `completed_qids.txt`
 """
 
 import os
+import re
 import sys
 import time
-import signal
+import json
 import random
 import logging
-import requests
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
+import requests
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Configuration from .env with fallback defaults
+# API Configuration
 API_URL = os.getenv("WIKIDATA_API_URL", "https://www.wikidata.org/w/api.php").strip()
+SPARQL_URL = "https://query.wikidata.org/sparql"
 BOT_USER = os.getenv("WIKIDATA_BOT_USER", "SHADOWARROW 2026@ShadowBot").strip()
 BOT_PASSWORD = os.getenv("WIKIDATA_BOT_PASSWORD", "").strip()
 
 USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026; contact: wikidata-bot@local) python-requests"
 STATE_FILE = "completed_qids.txt"
-RATE_LIMIT_DELAY = 2.5  # Seconds between POST edit requests
+LOG_FILE = "bot_execution.log"
+
+RATE_LIMIT_DELAY = 1.8  # Optimized 1.8s delay between atomic write operations
 MAXLAG = 5
 MAX_RETRIES = 5
+BATCH_FETCH_SIZE = 50
 
-# Setup UTF-8 logging for Windows console compatibility
+EDIT_SUMMARY = "Added missing Hindi and Bengali labels and descriptions"
+
+# Configure UTF-8 Logging
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -37,33 +50,122 @@ if hasattr(sys.stderr, "reconfigure"):
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    format="[%(asctime)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot_execution.log", encoding="utf-8")
+        logging.FileHandler(LOG_FILE, encoding="utf-8")
     ]
 )
 logger = logging.getLogger("WikidataBot")
 
-class WikidataBot:
+# Complete State & UT Mapping Dictionary
+INDIAN_STATES = {
+    "Andhra Pradesh": {"hi": "आंध्र प्रदेश", "bn": "অন্ধ্রপ্রদেশ"},
+    "Arunachal Pradesh": {"hi": "अरुणाचल प्रदेश", "bn": "অরুণাচল প্রদেশ"},
+    "Assam": {"hi": "असम", "bn": "অসম"},
+    "Bihar": {"hi": "बिहार", "bn": "বিহার"},
+    "Chhattisgarh": {"hi": "छत्तीसगढ़", "bn": "ছত্তিশগড়"},
+    "Goa": {"hi": "गोवा", "bn": "গোয়া"},
+    "Gujarat": {"hi": "गुजरात", "bn": "গুজরাত"},
+    "Haryana": {"hi": "हरियाणा", "bn": "হরিয়ানা"},
+    "Himachal Pradesh": {"hi": "हिमाचल प्रदेश", "bn": "হিমাচল প্রদেশ"},
+    "Jharkhand": {"hi": "झारखंड", "bn": "ঝাড়খণ্ড"},
+    "Karnataka": {"hi": "कर्नाटक", "bn": "কর্ণাটক"},
+    "Kerala": {"hi": "केरल", "bn": "কেরালা"},
+    "Madhya Pradesh": {"hi": "मध्य प्रदेश", "bn": "মধ্যপ্রদেশ"},
+    "Maharashtra": {"hi": "महाराष्ट्र", "bn": "মহারাষ্ট্র"},
+    "Manipur": {"hi": "मणिपुर", "bn": "মণিপুর"},
+    "Meghalaya": {"hi": "मेघालय", "bn": "মেঘালয়"},
+    "Mizoram": {"hi": "मिजोरम", "bn": "মিজোরাম"},
+    "Nagaland": {"hi": "नागालैंड", "bn": "নাগাল্যান্ড"},
+    "Odisha": {"hi": "ओडिशा", "bn": "ওড়িশা"},
+    "Orissa": {"hi": "ओडिशा", "bn": "ওড়িশা"},
+    "Punjab": {"hi": "पंजाब", "bn": "পাঞ্জাব"},
+    "Rajasthan": {"hi": "राजस्थान", "bn": "রাজস্থান"},
+    "Sikkim": {"hi": "सिक्किम", "bn": "সিকিম"},
+    "Tamil Nadu": {"hi": "तमिलनाडु", "bn": "তামিলনাড়ু"},
+    "Telangana": {"hi": "तेलंगाना", "bn": "তেলেঙ্গানা"},
+    "Tripura": {"hi": "त्रिपुरा", "bn": "ত্রিপুরা"},
+    "Uttar Pradesh": {"hi": "उत्तर प्रदेश", "bn": "উত্তরপ্রদেশ"},
+    "Uttarakhand": {"hi": "उत्तराखंड", "bn": "উত্তরাখণ্ড"},
+    "West Bengal": {"hi": "पश्चिम बंगाल", "bn": "পশ্চিমবঙ্গ"},
+    "Delhi": {"hi": "दिल्ली", "bn": "দিল্লি"},
+    "Jammu and Kashmir": {"hi": "जम्मू और कश्मीर", "bn": "জম্মু ও কাশ্মীর"},
+    "Ladakh": {"hi": "लद्दाख", "bn": "লাদাখ"},
+    "Puducherry": {"hi": "पुदुचेरी", "bn": "পুদুচেরি"},
+    "Chandigarh": {"hi": "चंडीगढ़", "bn": "চণ্ডীগড়"}
+}
+
+def parse_english_description(en_desc: str) -> Optional[Tuple[str, str]]:
+    """
+    Parses English description ('en') to extract entity type and state.
+    Returns (type, state) or None if no match.
+    """
+    if not en_desc or not isinstance(en_desc, str):
+        return None
+
+    desc_clean = en_desc.strip()
+
+    patterns = [
+        (r'\b(?:city|town|human settlement|municipality)\s+(?:in|of)\s+(?:the\s+Indian\s+state\s+of\s+)?([A-Za-z\s]+?)(?:,\s*India)?$', 'city'),
+        (r'\b(?:village|gram panchayat)\s+(?:in|of)\s+(?:the\s+Indian\s+state\s+of\s+)?([A-Za-z\s]+?)(?:,\s*India)?$', 'village'),
+        (r'\b(?:district|administrative district)\s+(?:in|of)\s+(?:the\s+Indian\s+state\s+of\s+)?([A-Za-z\s]+?)(?:,\s*India)?$', 'district'),
+        (r'\b(?:river|watercourse|tributary)\s+(?:in|of)\s+(?:the\s+Indian\s+state\s+of\s+)?([A-Za-z\s]+?)(?:,\s*India)?$', 'river')
+    ]
+
+    for pattern, entity_type in patterns:
+        match = re.search(pattern, desc_clean, re.IGNORECASE)
+        if match:
+            extracted_state = match.group(1).strip()
+            extracted_state = re.sub(r'\s+state$', '', extracted_state, flags=re.IGNORECASE).strip()
+            
+            for state_key in INDIAN_STATES:
+                if state_key.lower() == extracted_state.lower():
+                    return entity_type, state_key
+
+    return None
+
+def generate_localized_descriptions(entity_type: str, state_name: str) -> Optional[Dict[str, str]]:
+    """Generates localized Hindi and Bengali descriptions for state & entity type."""
+    state_map = INDIAN_STATES.get(state_name)
+    if not state_map:
+        return None
+
+    state_hi = state_map["hi"]
+    state_bn = state_map["bn"]
+
+    if entity_type in ('city', 'town'):
+        return {
+            "hi": f"भारत के {state_hi} राज्य का एक शहर",
+            "bn": f"ভারতের {state_bn} রাজ্যের একটি শহর"
+        }
+    elif entity_type == 'village':
+        return {
+            "hi": f"भारत के {state_hi} राज्य का एक गाँव",
+            "bn": f"ভারতের {state_bn} রাজ্যের একটি গ্রাম"
+        }
+    elif entity_type == 'district':
+        return {
+            "hi": f"भारत के {state_hi} राज्य का एक ज़िला",
+            "bn": f"ভারতের {state_bn} রাজ্যের একটি জেলা"
+        }
+    elif entity_type == 'river':
+        return {
+            "hi": f"भारत के {state_hi} राज्य की एक नदी",
+            "bn": f"ভারতের {state_bn} রাজ্যের একটি নদী"
+        }
+
+    return None
+
+class HighThroughputWikidataBot:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
-        self.csrf_token = None
+        self.csrf_token: Optional[str] = None
         self.completed_qids = self._load_completed_qids()
-        self.running = True
-
-        # Signal handler for graceful shutdown (Ctrl + C)
-        signal.signal(signal.SIGINT, self._handle_shutdown)
-        signal.signal(signal.SIGTERM, self._handle_shutdown)
-
-    def _handle_shutdown(self, signum, frame):
-        logger.info("\n[!] Graceful shutdown signal received. Finishing current operation and saving state...")
-        self.running = False
 
     def _load_completed_qids(self) -> set:
-        """Loads previously processed QIDs from local state file for resumability."""
         completed = set()
         if os.path.exists(STATE_FILE):
             try:
@@ -72,13 +174,12 @@ class WikidataBot:
                         line = line.strip()
                         if line and not line.startswith("#"):
                             completed.add(line.upper())
-                logger.info(f"[State] Loaded {len(completed)} previously completed QIDs from '{STATE_FILE}'.")
+                logger.info(f"[State] Loaded {len(completed)} completed QIDs from '{STATE_FILE}'.")
             except Exception as e:
                 logger.error(f"[State] Error loading state file: {e}")
         return completed
 
     def _mark_completed(self, qid: str):
-        """Immediately records completed QID to state file."""
         qid_clean = qid.strip().upper()
         if qid_clean in self.completed_qids:
             return
@@ -88,13 +189,11 @@ class WikidataBot:
                 f.write(f"{qid_clean}\n")
                 f.flush()
         except Exception as e:
-            logger.error(f"[State] Failed to record QID {qid_clean} to state file: {e}")
+            logger.error(f"[State] Failed recording QID {qid_clean}: {e}")
 
-    def _request_with_retry(self, method: str, params: dict = None, data: dict = None, is_write: bool = False) -> dict:
-        """Executes API HTTP requests with exponential backoff, maxlag checks, and rate-limiting."""
+    def request_mediawiki(self, method: str, params: dict = None, data: dict = None, is_write: bool = False) -> dict:
         params = params or {}
         data = data or {}
-
         params["format"] = "json"
         params["formatversion"] = "2"
         if is_write:
@@ -104,55 +203,37 @@ class WikidataBot:
         backoff = 2.0
 
         while attempt <= MAX_RETRIES:
-            if not self.running:
-                raise KeyboardInterrupt("Bot execution stopped by user.")
-
             attempt += 1
             try:
-                start_t = time.time()
                 if method.upper() == "POST":
-                    # Enforce rate limit delay before write requests
                     time.sleep(RATE_LIMIT_DELAY)
-                    response = self.session.post(API_URL, params=params, data=data, timeout=30)
+                    res = self.session.post(API_URL, params=params, data=data, timeout=30)
                 else:
-                    response = self.session.get(API_URL, params=params, timeout=30)
+                    res = self.session.get(API_URL, params=params, timeout=30)
 
-                latency = time.time() - start_t
-
-                # Handle HTTP Status errors (429 Too Many Requests / 5xx Server Errors)
-                if response.status_code in (429, 500, 502, 503, 504):
-                    retry_after = response.headers.get("Retry-After")
-                    wait_time = float(retry_after) if (retry_after and retry_after.isdigit()) else (backoff + random.uniform(0.5, 1.5))
-                    logger.warning(f"[HTTP {response.status_code}] Rate limited/Server busy ({latency:.2f}s). Retrying in {wait_time:.2f}s...")
-                    time.sleep(wait_time)
+                if res.status_code in (429, 500, 502, 503, 504):
+                    wait_t = float(res.headers.get("Retry-After", backoff))
+                    logger.warning(f"[HTTP {res.status_code}] Rate limited. Pausing for {wait_t:.2f}s...")
+                    time.sleep(wait_t)
                     backoff *= 2.0
                     continue
 
-                response.raise_for_status()
-                res_json = response.json()
+                res.raise_for_status()
+                res_json = res.json()
 
-                # Check MediaWiki API error structures
                 if "error" in res_json:
                     err = res_json["error"]
                     err_code = err.get("code", "")
                     err_info = err.get("info", "")
 
                     if err_code == "maxlag":
-                        retry_after = response.headers.get("Retry-After", "5")
-                        wait_t = float(retry_after) if retry_after.isdigit() else 5.0
-                        logger.warning(f"[MediaWiki Maxlag] Server lag exceeded ({err_info}). Pausing for {wait_t}s...")
+                        wait_t = float(res.headers.get("Retry-After", "5"))
+                        logger.warning(f"[MediaWiki Maxlag] Server lag ({err_info}). Pausing for {wait_t}s...")
                         time.sleep(wait_t)
-                        continue
-
-                    if err_code in ("readonly", "ratelimited"):
-                        wait_t = backoff + random.uniform(1.0, 2.0)
-                        logger.warning(f"[MediaWiki {err_code}] {err_info}. Retrying in {wait_t:.2f}s...")
-                        time.sleep(wait_t)
-                        backoff *= 2.0
                         continue
 
                     if err_code in ("badtoken", "notloggedin") and is_write and attempt < MAX_RETRIES:
-                        logger.warning(f"[Auth] Token invalid/expired ({err_code}). Re-authenticating...")
+                        logger.warning(f"[Auth] CSRF token invalid/expired ({err_code}). Re-authenticating...")
                         self.login()
                         if data and self.csrf_token:
                             data["token"] = self.csrf_token
@@ -160,323 +241,235 @@ class WikidataBot:
 
                 return res_json
 
-            except (requests.RequestException, ValueError) as e:
+            except Exception as e:
                 wait_t = backoff + random.uniform(0.5, 1.5)
-                logger.warning(f"[Network Error] {e}. Retrying in {wait_t:.2f}s (Attempt {attempt}/{MAX_RETRIES})...")
+                logger.warning(f"[Network Error] {e}. Retrying in {wait_t:.2f}s...")
                 time.sleep(wait_t)
                 backoff *= 2.0
 
-        raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded for MediaWiki API request.")
+        return {}
 
     def login(self) -> bool:
         """
-        Performs 2-Stage MediaWiki Action API Authentication.
-        Step 1: Request logintoken
-        Step 2: POST action=login
-        Step 3: Request csrftoken for edit operations
+        Performs 2-Stage MediaWiki Authentication and fetches CSRF token ONCE for session reuse.
         """
         logger.info(f"[Auth] Authenticating as bot user: '{BOT_USER}'...")
-
-        # Step 1: Request logintoken
-        res_token = self._request_with_retry("GET", params={"action": "query", "meta": "tokens", "type": "login"})
+        res_token = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "login"})
         login_token = res_token.get("query", {}).get("tokens", {}).get("logintoken")
 
         if not login_token:
-            raise RuntimeError("Failed to obtain logintoken from MediaWiki API.")
+            raise RuntimeError("Failed to obtain logintoken.")
 
-        # Step 2: POST action=login
-        login_data = {
+        login_res = self.request_mediawiki("POST", data={
             "action": "login",
             "lgname": BOT_USER,
             "lgpassword": BOT_PASSWORD,
             "lgtoken": login_token
-        }
-        login_res = self._request_with_retry("POST", data=login_data)
-        result = login_res.get("login", {}).get("result")
+        })
+        if login_res.get("login", {}).get("result") != "Success":
+            raise RuntimeError(f"Login failed: {login_res}")
 
-        if result != "Success":
-            reason = login_res.get("login", {}).get("reason", "Unknown authentication failure")
-            raise RuntimeError(f"Login failed: {result} - {reason}")
-
-        logger.info("[Auth] Successfully logged into Wikidata MediaWiki Action API!")
-
-        # Step 3: Fetch CSRF edit token
+        logger.info("[Auth] Successfully authenticated with MediaWiki Action API.")
+        
+        # Fetch one-time CSRF token for the session
         self.refresh_csrf_token()
         return True
 
     def refresh_csrf_token(self) -> str:
-        """Fetches a fresh CSRF token required for wbsetlabel and wbsetdescription edits."""
-        logger.debug("[Auth] Fetching CSRF edit token...")
-        res = self._request_with_retry("GET", params={"action": "query", "meta": "tokens", "type": "csrf"})
-        csrf_token = res.get("query", {}).get("tokens", {}).get("csrftoken")
+        """Fetches one-time CSRF token for write operations."""
+        logger.debug("[Auth] Fetching session CSRF token...")
+        res = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "csrf"})
+        token = res.get("query", {}).get("tokens", {}).get("csrftoken")
+        
+        if not token or token == "+\\":
+            raise RuntimeError("Obtained invalid CSRF token.")
 
-        if not csrf_token or csrf_token == "+\\":
-            raise RuntimeError("Invalid CSRF edit token received. Check bot permissions.")
+        self.csrf_token = token
+        logger.debug("[Auth] Session CSRF token stored.")
+        return token
 
-        self.csrf_token = csrf_token
-        logger.debug("[Auth] CSRF edit token acquired.")
-        return csrf_token
+    def fetch_sparql_batch(self) -> List[str]:
+        """Queries Wikidata SPARQL endpoint with automatic MediaWiki API random entity fallback."""
+        queries = [
+            """
+            SELECT ?item WHERE {
+              ?item wdt:P31 wd:Q515 . # City
+              ?item wdt:P17 wd:Q668 . # India
+              FILTER NOT EXISTS { ?item schema:description ?bnDesc . FILTER(LANG(?bnDesc) = "bn") }
+            } LIMIT 200
+            """,
+            """
+            SELECT ?item WHERE {
+              ?item wdt:P31 wd:Q4022 . # River
+              ?item wdt:P17 wd:Q668 .  # India
+              FILTER NOT EXISTS { ?item schema:description ?bnDesc . FILTER(LANG(?bnDesc) = "bn") }
+            } LIMIT 200
+            """
+        ]
 
-    def get_entity_data(self, qid: str) -> dict:
-        """Fetches existing labels and descriptions for a Wikidata item."""
+        selected_query = random.choice(queries)
+
+        try:
+            res = requests.get(SPARQL_URL, params={"query": selected_query, "format": "json"}, headers={"User-Agent": USER_AGENT}, timeout=10)
+            if res.status_code == 200:
+                bindings = res.json().get("results", {}).get("bindings", [])
+                qids = []
+                for b in bindings:
+                    uri = b.get("item", {}).get("value", "")
+                    if "/entity/" in uri:
+                        qids.append(uri.split("/entity/")[-1])
+                if qids:
+                    return qids
+        except Exception as e:
+            logger.warning(f"[SPARQL Lag] {e}. Switching to MediaWiki Action API generator...")
+
+        # Fallback Generator: Query MediaWiki Action API directly for random mainspace QIDs
+        res = self.request_mediawiki("GET", params={
+            "action": "query",
+            "list": "random",
+            "rnnamespace": "0",
+            "rnlimit": "50"
+        })
+        random_items = res.get("query", {}).get("random", [])
+        return [item["title"] for item in random_items if item.get("title", "").startswith("Q")]
+
+    def fetch_entities_batch(self, qids_chunk: List[str]) -> Dict[str, Any]:
+        """Fetches up to 50 QIDs in a SINGLE HTTP GET query using action=wbgetentities."""
+        if not qids_chunk:
+            return {}
+
         params = {
             "action": "wbgetentities",
-            "ids": qid,
+            "ids": "|".join(qids_chunk[:BATCH_FETCH_SIZE]),
             "props": "labels|descriptions",
-            "languages": "bn|hi"
+            "languages": "en|bn|hi"
         }
-        res = self._request_with_retry("GET", params=params)
-        entities = res.get("entities", {})
-        return entities.get(qid, {})
+        res = self.request_mediawiki("GET", params=params)
+        return res.get("entities", {})
 
-    def process_item(self, item: dict) -> bool:
+    def process_item_atomic(self, qid: str, entity_data: dict) -> bool:
         """
-        Safety check & Edit execution:
-        Checks if Bengali ('bn') or Hindi ('hi') labels/descriptions exist.
-        Only edits if currently MISSING (idempotency check).
+        Idempotency check & Single Atomic Write (`action=wbeditentity`).
+        Combines all missing Bengali and Hindi labels/descriptions into ONE single POST request.
         """
-        qid = item.get("qid", "").strip().upper()
-        if not qid:
+        if qid in self.completed_qids:
             return False
 
-        if qid in self.completed_qids:
-            logger.info(f"[{qid}] Already processed in prior session. Skipping.")
-            return True
-
-        desired_labels = item.get("labels", {})
-        desired_descriptions = item.get("descriptions", {})
-        summary = item.get("summary", "Adding missing regional label/description via automated bot")
-
-        entity_data = self.get_entity_data(qid)
         if "missing" in entity_data:
-            logger.warning(f"[{qid}] Item does not exist on Wikidata. Skipping.")
             self._mark_completed(qid)
             return False
 
-        existing_labels = entity_data.get("labels", {})
-        existing_descriptions = entity_data.get("descriptions", {})
+        labels = entity_data.get("labels", {})
+        descriptions = entity_data.get("descriptions", {})
 
-        edits_made = 0
+        en_label = labels.get("en", {}).get("value", "").strip() if isinstance(labels.get("en"), dict) else ""
+        en_desc = descriptions.get("en", {}).get("value", "").strip() if isinstance(descriptions.get("en"), dict) else ""
 
-        # Process Labels (bn, hi)
-        for lang in ("bn", "hi"):
-            new_label = desired_labels.get(lang)
-            if not new_label:
-                continue
+        # Prepare Atomic Data Payload
+        edit_payload_data = {"labels": {}, "descriptions": {}}
+        fields_updated = []
 
-            current_label_obj = existing_labels.get(lang)
-            if current_label_obj and current_label_obj.get("value", "").strip():
-                logger.info(f"[{qid}] Skipped '{lang}' label: already exists ('{current_label_obj.get('value')}')")
-                continue
+        # 1. Labels check (bn, hi)
+        if en_label:
+            if "bn" not in labels:
+                edit_payload_data["labels"]["bn"] = {"language": "bn", "value": en_label}
+                fields_updated.append("bn_label")
+            if "hi" not in labels:
+                edit_payload_data["labels"]["hi"] = {"language": "hi", "value": en_label}
+                fields_updated.append("hi_label")
 
-            # Target language label missing! Set label.
-            self._set_label(qid, lang, new_label.strip(), summary)
-            edits_made += 1
+        # 2. Descriptions check (bn, hi)
+        if en_desc:
+            parsed = parse_english_description(en_desc)
+            if parsed:
+                entity_type, state_name = parsed
+                localized_descs = generate_localized_descriptions(entity_type, state_name)
+                if localized_descs:
+                    if "bn" not in descriptions and "bn" in localized_descs:
+                        edit_payload_data["descriptions"]["bn"] = {"language": "bn", "value": localized_descs["bn"]}
+                        fields_updated.append("bn_desc")
+                    if "hi" not in descriptions and "hi" in localized_descs:
+                        edit_payload_data["descriptions"]["hi"] = {"language": "hi", "value": localized_descs["hi"]}
+                        fields_updated.append("hi_desc")
 
-        # Process Descriptions (bn, hi)
-        for lang in ("bn", "hi"):
-            new_desc = desired_descriptions.get(lang)
-            if not new_desc:
-                continue
+        # Clean empty fields from payload
+        if not edit_payload_data["labels"]:
+            del edit_payload_data["labels"]
+        if not edit_payload_data["descriptions"]:
+            del edit_payload_data["descriptions"]
 
-            current_desc_obj = existing_descriptions.get(lang)
-            if current_desc_obj and current_desc_obj.get("value", "").strip():
-                logger.info(f"[{qid}] Skipped '{lang}' description: already exists ('{current_desc_obj.get('value')}')")
-                continue
+        if not edit_payload_data:
+            self._mark_completed(qid)
+            return False
 
-            # Target language description missing! Set description.
-            self._set_description(qid, lang, new_desc.strip(), summary)
-            edits_made += 1
-
-        if edits_made == 0:
-            logger.info(f"[{qid}] Check complete. No missing Bengali/Hindi fields to add.")
-
-        # Mark QID as completed in state file
-        self._mark_completed(qid)
-        return True
-
-    def _set_label(self, qid: str, language: str, value: str, summary: str):
-        """Executes action=wbsetlabel POST request."""
+        # Execute Single Atomic POST Edit via action=wbeditentity
         if not self.csrf_token:
             self.refresh_csrf_token()
 
-        payload = {
-            "action": "wbsetlabel",
+        start_time = time.time()
+        post_data = {
+            "action": "wbeditentity",
             "id": qid,
-            "language": language,
-            "value": value,
-            "summary": summary,
+            "data": json.dumps(edit_payload_data, ensure_ascii=False),
+            "summary": EDIT_SUMMARY,
             "token": self.csrf_token,
             "bot": "1"
         }
-        logger.info(f"[{qid}] Adding missing '{language}' label -> '{value}'")
-        res = self._request_with_retry("POST", data=payload, is_write=True)
+
+        res = self.request_mediawiki("POST", data=post_data, is_write=True)
+        latency = time.time() - start_time
+
         if res.get("success") == 1:
-            logger.info(f"[{qid}] SUCCESS: '{language}' label updated!")
+            fields_str = "+".join(fields_updated)
+            logger.info(f"QID: {qid} | Action: Updated {fields_str} | Latency: {latency:.2f}s | Status: OK")
+            self._mark_completed(qid)
+            return True
         else:
-            logger.error(f"[{qid}] FAILED updating '{language}' label: {res}")
-
-    def _set_description(self, qid: str, language: str, value: str, summary: str):
-        """Executes action=wbsetdescription POST request."""
-        if not self.csrf_token:
-            self.refresh_csrf_token()
-
-        payload = {
-            "action": "wbsetdescription",
-            "id": qid,
-            "language": language,
-            "value": value,
-            "summary": summary,
-            "token": self.csrf_token,
-            "bot": "1"
-        }
-        logger.info(f"[{qid}] Adding missing '{language}' description -> '{value}'")
-        res = self._request_with_retry("POST", data=payload, is_write=True)
-        if res.get("success") == 1:
-            logger.info(f"[{qid}] SUCCESS: '{language}' description updated!")
-        else:
-            logger.error(f"[{qid}] FAILED updating '{language}' description: {res}")
-
-def generate_target_items() -> list:
-    """
-    Built-in target list generator containing regional entities (cities, monuments, geography, rivers)
-    with proposed Bengali ('bn') and Hindi ('hi') labels and descriptions.
-    """
-    return [
-        {
-            "qid": "Q42",
-            "labels": {"bn": "ডগলাস অ্যাডামস", "hi": "डगलस एडम्स"},
-            "descriptions": {"bn": "ইংরেজি লেখক এবং কৌতুক অভিনেতা", "hi": "अंग्रेजी लेखक और हास्य अभिनेता"}
-        },
-        {
-            "qid": "Q180126",
-            "labels": {"bn": "কলকাতা", "hi": "कोलकाता"},
-            "descriptions": {"bn": "ভারতের পশ্চিমবঙ্গের রাজধানী", "hi": "भारत के पश्चिम बंगाल राज्य की राजधानी"}
-        },
-        {
-            "qid": "Q1353",
-            "labels": {"bn": "দিল্লি", "hi": "दिल्ली"},
-            "descriptions": {"bn": "ভারতের রাজধানী অঞ্চল", "hi": "भारत की राजधानी"}
-        },
-        {
-            "qid": "Q1156",
-            "labels": {"bn": "মুম্বই", "hi": "मुंबई"},
-            "descriptions": {"bn": "ভারতের মহারাষ্ট্রের রাজধানী", "hi": "भारत के महाराष्ट्र राज्य की राजधानी"}
-        },
-        {
-            "qid": "Q1355",
-            "labels": {"bn": "বেঙ্গালুরু", "hi": "बेंगलुरु"},
-            "descriptions": {"bn": "ভারতের কর্ণাটকের রাজধানী", "hi": "भारत के कर्नाटक राज्य की राजधानी"}
-        },
-        {
-            "qid": "Q1538",
-            "labels": {"bn": "পুনে", "hi": "पुणे"},
-            "descriptions": {"bn": "ভারতের মহারাষ্ট্রের একটি শহর", "hi": "भारत के महाराष्ट्र राज्य का एक शहर"}
-        },
-        {
-            "qid": "Q66616",
-            "labels": {"bn": "সুন্দরবন", "hi": "सुंदरवन"},
-            "descriptions": {"bn": "বঙ্গোপসাগরের অববাহিকায় অবস্থিত ম্যানগ্রোভ বন", "hi": "बंगाल की खाड़ी के डेल्टा में स्थित मैन्ग्रोव वन क्षेत्र"}
-        },
-        {
-            "qid": "Q5488",
-            "labels": {"bn": "গঙ্গা নদী", "hi": "गंगा नदी"},
-            "descriptions": {"bn": "ভারত ও বাংলাদেশের একটি আন্তর্জাতিক নদী", "hi": "भारत और बांग्लादेश में बहने वाली एक प्रमुख नदी"}
-        }
-    ]
-
-def load_custom_items(file_path: str) -> list:
-    """Loads target edit records from a custom JSON or CSV file."""
-    path = Path(file_path)
-    if not path.exists():
-        logger.error(f"[Feeder] File not found: {file_path}")
-        return []
-
-    items = []
-    if path.suffix.lower() == ".json":
-        import json
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            for entry in data:
-                if "qid" in entry:
-                    items.append(entry)
-        logger.info(f"[Feeder] Loaded {len(items)} items from JSON file '{file_path}'.")
-    elif path.suffix.lower() == ".csv":
-        import csv
-        with open(path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                qid = row.get("qid") or row.get("QID")
-                if not qid:
-                    continue
-                labels = {}
-                descs = {}
-                for k, v in row.items():
-                    if not k or not v:
-                        continue
-                    k_lower = k.lower().strip()
-                    if k_lower.startswith("label_"):
-                        labels[k_lower.replace("label_", "")] = v.strip()
-                    elif k_lower.startswith("desc_"):
-                        descs[k_lower.replace("desc_", "")] = v.strip()
-                items.append({
-                    "qid": qid,
-                    "labels": labels,
-                    "descriptions": descs,
-                    "summary": row.get("summary", "Adding missing regional label/description via automated bot")
-                })
-        logger.info(f"[Feeder] Loaded {len(items)} items from CSV file '{file_path}'.")
-    return items
+            logger.error(f"QID: {qid} | Action: Failed atomic edit | Latency: {latency:.2f}s | Response: {res}")
+            return False
 
 def main():
     logger.info("==========================================================")
-    logger.info(" Starting Wikidata Regional Label & Description Bot ")
-    logger.info(" Target Languages: Bengali ('bn') & Hindi ('hi') ")
+    logger.info(" Starting High-Throughput Production Wikidata Bot ")
+    logger.info(" Mode: Atomic wbeditentity | Batch: 50 | Delay: 1.8s ")
     logger.info("==========================================================")
 
-    # Check if a custom input file was passed via CLI
-    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
-        input_file = sys.argv[1]
-        logger.info(f"[Feeder] Loading target items from: '{input_file}'")
-        items = load_custom_items(input_file)
-    else:
-        logger.info("[Feeder] Loading built-in default target items generator...")
-        items = generate_target_items()
+    bot = HighThroughputWikidataBot()
 
-    if not items:
-        logger.error("[Feeder] No items to process. Exiting.")
-        sys.exit(0)
-
-    bot = WikidataBot()
-
-    # Step 1: Login
     try:
         bot.login()
     except Exception as e:
         logger.critical(f"[Fatal] Authentication failed: {e}")
         sys.exit(1)
 
-    logger.info(f"[Target] Total items in queue: {len(items)}")
+    # Infinite / Continuous Pipeline Loop
+    while True:
+        logger.info("[SPARQL] Querying target items batch...")
+        qids = bot.fetch_sparql_batch()
+        logger.info(f"[SPARQL] Retrieved {len(qids)} items from SPARQL query.")
 
-    # Step 2: Run Continuous Execution Loop
-    processed_count = 0
-    for item in items:
-        if not bot.running:
-            break
-        try:
-            success = bot.process_item(item)
-            if success:
-                processed_count += 1
-        except KeyboardInterrupt:
-            logger.info("\n[!] User interrupted execution.")
-            break
-        except Exception as e:
-            logger.error(f"[Error] Unexpected error processing {item.get('qid')}: {e}")
+        pending_qids = [q for q in qids if q.upper() not in bot.completed_qids]
+        logger.info(f"[Pipeline] {len(pending_qids)} pending QIDs to process.")
 
-    logger.info("==========================================================")
-    logger.info(f" Run Finished. Total QIDs processed in session: {processed_count}")
-    logger.info(f" Saved state: {len(bot.completed_qids)} QIDs logged in '{STATE_FILE}'.")
-    logger.info("==========================================================")
+        if not pending_qids:
+            logger.info("[Pipeline] All retrieved QIDs processed. Sleeping 10s before next SPARQL fetch...")
+            time.sleep(10)
+            continue
+
+        # Process in batch chunks of 50 QIDs
+        for i in range(0, len(pending_qids), BATCH_FETCH_SIZE):
+            chunk = pending_qids[i : i + BATCH_FETCH_SIZE]
+            entities_batch = bot.fetch_entities_batch(chunk)
+
+            for qid in chunk:
+                entity_data = entities_batch.get(qid, {})
+                try:
+                    bot.process_item_atomic(qid, entity_data)
+                except KeyboardInterrupt:
+                    logger.info("\n[!] User interrupted execution.")
+                    sys.exit(0)
+                except Exception as e:
+                    logger.error(f"QID: {qid} | Error: {e}")
 
 if __name__ == "__main__":
     main()
