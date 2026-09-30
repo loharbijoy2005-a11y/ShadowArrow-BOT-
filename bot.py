@@ -1,16 +1,3 @@
-"""
-High-Speed Production Wikidata Automation Engine (bot.py)
-Designed for local execution and 24/7 Render background worker deployment.
-
-Architectural Rules:
-1. NO LABELS: Only edits localized descriptions. Never touches labels.
-2. Unicode Script Guardrails: Validates Bengali (\\u0980-\\u09FF) and Devanagari (\\u0900-\\u097F) scripts before write.
-3. Accurate State Localization: Parses English description, maps Indian State/UT, generates natural phrasing.
-4. One-Time CSRF Session Token & Batch Fetching (50 QIDs).
-5. Single Atomic POST Edit (`action=wbeditentity`) throttled at 1.8 seconds.
-6. Persistent Resumability (`completed_qids.txt`).
-"""
-
 import os
 import re
 import sys
@@ -18,15 +5,17 @@ import time
 import json
 import random
 import logging
+import unicodedata
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 import requests
 from dotenv import load_dotenv
+from indic_transliteration import sanscript
 
 load_dotenv()
 
-# Environment Credentials & Configuration
+# API Configuration
 API_URL = os.getenv("WIKIDATA_API_URL", "https://www.wikidata.org/w/api.php").strip()
 SPARQL_URL = "https://query.wikidata.org/sparql"
 BOT_USER = os.getenv("WIKIDATA_BOT_USER", "SHADOWARROW 2026@ShadowBot").strip()
@@ -36,16 +25,17 @@ USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026
 STATE_FILE = "completed_qids.txt"
 LOG_FILE = "bot_execution.log"
 
-RATE_LIMIT_DELAY = 1.8  # Strict 1.8s delay between write calls
+RATE_LIMIT_DELAY = 2.5  # 2.5s safe delay between write operations
 MAXLAG = 5
 MAX_RETRIES = 5
 BATCH_FETCH_SIZE = 50
 
-EDIT_SUMMARY = "Added missing Hindi and Bengali descriptions for Indian localities"
+EDIT_SUMMARY = "Added missing Hindi and Bengali labels and descriptions for Indian localities"
 
-# Unicode Script Regex Validators (Hard Guardrails)
+# Script Regex Validators (Hard Guardrails)
 BENGALI_SCRIPT_REGEX = re.compile(r'[\u0980-\u09FF]')
 DEVANAGARI_SCRIPT_REGEX = re.compile(r'[\u0900-\u097F]')
+LATIN_ALPHABET_REGEX = re.compile(r'[a-zA-Z]')
 
 # Configure UTF-8 Logging
 if hasattr(sys.stdout, "reconfigure"):
@@ -64,7 +54,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("WikidataBot")
 
-# Comprehensive Indian State & Union Territory Dictionary
+# Complete State & UT Mapping Dictionary
 INDIAN_STATES = {
     "Andhra Pradesh": {"hi": "आंध्र प्रदेश", "bn": "অন্ধ্রপ্রদেশ"},
     "Arunachal Pradesh": {"hi": "अरुणाचल प्रदेश", "bn": "অরুণাচল প্রদেশ"},
@@ -99,18 +89,58 @@ INDIAN_STATES = {
     "Jammu and Kashmir": {"hi": "जम्मू और कश्मीर", "bn": "জম্মু ও কাশ্মীর"},
     "Ladakh": {"hi": "लद्दाख", "bn": "লাদাখ"},
     "Puducherry": {"hi": "पुदुचेरी", "bn": "পুদুচেরি"},
-    "Chandigarh": {"hi": "चंडीगढ़", "bn": "চণ্ডীগড়"}
+    "Chandigarh": {"hi": "चंडीगढ़", "bn": "चंडीगढ़"}
 }
 
-def validate_unicode_script(text: str, lang: str) -> bool:
-    """Hard guardrail validating that generated text contains correct script characters."""
+def validate_script(text: str, lang: str) -> bool:
+    """
+    Strict Guardrail:
+    1. Text must match target Indic script (Devanagari for 'hi', Bengali for 'bn').
+    2. Text must NOT contain ANY Latin alphabet letters ([a-zA-Z]).
+    """
     if not text or not isinstance(text, str):
         return False
+
+    # Check Latin letters rejection
+    if LATIN_ALPHABET_REGEX.search(text):
+        return False
+
     if lang == "bn":
         return bool(BENGALI_SCRIPT_REGEX.search(text))
     elif lang == "hi":
         return bool(DEVANAGARI_SCRIPT_REGEX.search(text))
+
     return False
+
+def transliterate_label(en_label: str, target_lang: str) -> Optional[str]:
+    """
+    Transliterates Romanized English label to target Indic script via indic-transliteration.
+    Returns transliterated string if script validation passes, else None.
+    """
+    if not en_label or not isinstance(en_label, str):
+        return None
+
+    clean_label = en_label.strip()
+
+    try:
+        if target_lang == "hi":
+            translit = sanscript.transliterate(clean_label, sanscript.ITRANS, sanscript.DEVANAGARI)
+        elif target_lang == "bn":
+            translit = sanscript.transliterate(clean_label, sanscript.ITRANS, sanscript.BENGALI)
+        else:
+            return None
+
+        # Apply NFC Unicode normalization & clean whitespace
+        translit = unicodedata.normalize('NFC', translit).strip()
+
+        # Strict validation check
+        if validate_script(translit, target_lang):
+            return translit
+
+    except Exception as e:
+        logger.debug(f"Transliteration error for '{clean_label}': {e}")
+
+    return None
 
 def parse_english_description(en_desc: str) -> Optional[Tuple[str, str]]:
     """
@@ -173,7 +203,7 @@ def generate_localized_descriptions(entity_type: str, state_name: str) -> Option
 
     return None
 
-class WikidataAutomationEngine:
+class MultilingualWikidataEngine:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
@@ -240,6 +270,14 @@ class WikidataAutomationEngine:
                     err = res_json["error"]
                     err_code = err.get("code", "")
                     err_info = err.get("info", "")
+                    messages = err.get("messages", [])
+
+                    # Check for actionthrottledtext
+                    is_throttled = any("actionthrottledtext" in str(m) for m in messages)
+                    if is_throttled:
+                        logger.warning(f"[Wikimedia Anti-Abuse Rate Throttle] Pausing for 15.0s before retry...")
+                        time.sleep(15.0)
+                        continue
 
                     if err_code == "maxlag":
                         wait_t = float(res.headers.get("Retry-After", "5"))
@@ -352,7 +390,7 @@ class WikidataAutomationEngine:
         params = {
             "action": "wbgetentities",
             "ids": "|".join(qids_chunk[:BATCH_FETCH_SIZE]),
-            "props": "descriptions",
+            "props": "labels|descriptions",
             "languages": "en|bn|hi"
         }
         res = self.request_mediawiki("GET", params=params)
@@ -360,8 +398,9 @@ class WikidataAutomationEngine:
 
     def process_item_atomic(self, qid: str, entity_data: dict) -> bool:
         """
-        Idempotency Check & Atomic Update (`action=wbeditentity`).
-        Strictly edits ONLY localized descriptions. NO LABELS ARE EVER TOUCHED.
+        Idempotency Check & Atomic Multi-Field Update (`action=wbeditentity`).
+        Populates BOTH missing Labels and Descriptions in Hindi ('hi') and Bengali ('bn').
+        Applies strict script validation and transliteration guardrails.
         """
         if qid in self.completed_qids:
             return False
@@ -370,49 +409,56 @@ class WikidataAutomationEngine:
             self._mark_completed(qid)
             return False
 
+        labels = entity_data.get("labels", {})
         descriptions = entity_data.get("descriptions", {})
-        en_desc_obj = descriptions.get("en", {})
-        en_desc = en_desc_obj.get("value", "").strip() if isinstance(en_desc_obj, dict) else ""
 
-        if not en_desc:
-            self._mark_completed(qid)
-            return False
+        en_label = labels.get("en", {}).get("value", "").strip() if isinstance(labels.get("en"), dict) else ""
+        en_desc = descriptions.get("en", {}).get("value", "").strip() if isinstance(descriptions.get("en"), dict) else ""
 
-        parsed = parse_english_description(en_desc)
-        if not parsed:
-            self._mark_completed(qid)
-            return False
-
-        entity_type, state_name = parsed
-        localized_descs = generate_localized_descriptions(entity_type, state_name)
-
-        if not localized_descs:
-            self._mark_completed(qid)
-            return False
-
-        # Prepare Descriptions-Only Atomic Data Payload (NO LABELS)
-        edit_payload_descriptions = {}
+        edit_payload = {"labels": {}, "descriptions": {}}
         fields_updated = []
 
-        # 1. Bengali Description Check
-        if "bn" not in descriptions and "bn" in localized_descs:
-            bn_val = localized_descs["bn"]
-            if validate_unicode_script(bn_val, "bn"):
-                edit_payload_descriptions["bn"] = {"language": "bn", "value": bn_val}
-                fields_updated.append("bn_desc")
+        # 1. Process Transliterated Labels (hi, bn)
+        if en_label:
+            if "hi" not in labels:
+                hi_translit = transliterate_label(en_label, "hi")
+                if hi_translit and validate_script(hi_translit, "hi"):
+                    edit_payload["labels"]["hi"] = {"language": "hi", "value": hi_translit}
+                    fields_updated.append("hi_label")
 
-        # 2. Hindi Description Check
-        if "hi" not in descriptions and "hi" in localized_descs:
-            hi_val = localized_descs["hi"]
-            if validate_unicode_script(hi_val, "hi"):
-                edit_payload_descriptions["hi"] = {"language": "hi", "value": hi_val}
-                fields_updated.append("hi_desc")
+            if "bn" not in labels:
+                bn_translit = transliterate_label(en_label, "bn")
+                if bn_translit and validate_script(bn_translit, "bn"):
+                    edit_payload["labels"]["bn"] = {"language": "bn", "value": bn_translit}
+                    fields_updated.append("bn_label")
 
-        if not edit_payload_descriptions:
+        # 2. Process State-Mapped Descriptions (hi, bn)
+        if en_desc:
+            parsed = parse_english_description(en_desc)
+            if parsed:
+                entity_type, state_name = parsed
+                localized_descs = generate_localized_descriptions(entity_type, state_name)
+                if localized_descs:
+                    if "bn" not in descriptions and "bn" in localized_descs:
+                        bn_desc_val = localized_descs["bn"]
+                        if validate_script(bn_desc_val, "bn"):
+                            edit_payload["descriptions"]["bn"] = {"language": "bn", "value": bn_desc_val}
+                            fields_updated.append("bn_desc")
+                    if "hi" not in descriptions and "hi" in localized_descs:
+                        hi_desc_val = localized_descs["hi"]
+                        if validate_script(hi_desc_val, "hi"):
+                            edit_payload["descriptions"]["hi"] = {"language": "hi", "value": hi_desc_val}
+                            fields_updated.append("hi_desc")
+
+        # Clean empty sections
+        if not edit_payload["labels"]:
+            del edit_payload["labels"]
+        if not edit_payload["descriptions"]:
+            del edit_payload["descriptions"]
+
+        if not edit_payload:
             self._mark_completed(qid)
             return False
-
-        atomic_payload = {"descriptions": edit_payload_descriptions}
 
         # Execute Single Atomic POST Edit via action=wbeditentity
         if not self.csrf_token:
@@ -422,7 +468,7 @@ class WikidataAutomationEngine:
         post_data = {
             "action": "wbeditentity",
             "id": qid,
-            "data": json.dumps(atomic_payload, ensure_ascii=False),
+            "data": json.dumps(edit_payload, ensure_ascii=False),
             "summary": EDIT_SUMMARY,
             "token": self.csrf_token,
             "bot": "1"
@@ -442,11 +488,11 @@ class WikidataAutomationEngine:
 
 def main():
     logger.info("==========================================================")
-    logger.info(" Starting Wikidata Production Automation Engine (bot.py) ")
-    logger.info(" Mode: Descriptions-Only | Batch: 50 | Delay: 1.8s ")
+    logger.info(" Starting Multilingual Wikidata Engine (bot.py) ")
+    logger.info(" Mode: Atomic Labels + Descriptions | Batch: 50 | Delay: 1.8s ")
     logger.info("==========================================================")
 
-    bot = WikidataAutomationEngine()
+    bot = MultilingualWikidataEngine()
 
     try:
         bot.login()
