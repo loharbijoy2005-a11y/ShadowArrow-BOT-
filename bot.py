@@ -1,13 +1,14 @@
 """
-High-Throughput Production Wikidata Bot (bot.py)
-Features:
-- Single Atomic Edit Call using `action=wbeditentity` (combines all missing fields per QID in 1 request)
-- Batch Fetching in chunks of 50 QIDs via `action=wbgetentities`
-- One-Time CSRF Token reuse per session
-- 1.8s Rate-limit delay & exponential backoff on maxlag/429
-- Dynamic State-to-Language NLP mapping (strict zero-guesswork)
-- Strictly neutral edit summary: 'Added missing Hindi and Bengali labels and descriptions'
-- Resumability via `completed_qids.txt`
+High-Speed Production Wikidata Automation Engine (bot.py)
+Designed for local execution and 24/7 Render background worker deployment.
+
+Architectural Rules:
+1. NO LABELS: Only edits localized descriptions. Never touches labels.
+2. Unicode Script Guardrails: Validates Bengali (\\u0980-\\u09FF) and Devanagari (\\u0900-\\u097F) scripts before write.
+3. Accurate State Localization: Parses English description, maps Indian State/UT, generates natural phrasing.
+4. One-Time CSRF Session Token & Batch Fetching (50 QIDs).
+5. Single Atomic POST Edit (`action=wbeditentity`) throttled at 1.8 seconds.
+6. Persistent Resumability (`completed_qids.txt`).
 """
 
 import os
@@ -25,22 +26,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# API Configuration
+# Environment Credentials & Configuration
 API_URL = os.getenv("WIKIDATA_API_URL", "https://www.wikidata.org/w/api.php").strip()
 SPARQL_URL = "https://query.wikidata.org/sparql"
 BOT_USER = os.getenv("WIKIDATA_BOT_USER", "SHADOWARROW 2026@ShadowBot").strip()
 BOT_PASSWORD = os.getenv("WIKIDATA_BOT_PASSWORD", "").strip()
 
-USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026; contact: wikidata-bot@local) python-requests"
+USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026) python-requests"
 STATE_FILE = "completed_qids.txt"
 LOG_FILE = "bot_execution.log"
 
-RATE_LIMIT_DELAY = 1.8  # Optimized 1.8s delay between atomic write operations
+RATE_LIMIT_DELAY = 1.8  # Strict 1.8s delay between write calls
 MAXLAG = 5
 MAX_RETRIES = 5
 BATCH_FETCH_SIZE = 50
 
-EDIT_SUMMARY = "Added missing Hindi and Bengali labels and descriptions"
+EDIT_SUMMARY = "Added missing Hindi and Bengali descriptions for Indian localities"
+
+# Unicode Script Regex Validators (Hard Guardrails)
+BENGALI_SCRIPT_REGEX = re.compile(r'[\u0980-\u09FF]')
+DEVANAGARI_SCRIPT_REGEX = re.compile(r'[\u0900-\u097F]')
 
 # Configure UTF-8 Logging
 if hasattr(sys.stdout, "reconfigure"):
@@ -59,7 +64,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("WikidataBot")
 
-# Complete State & UT Mapping Dictionary
+# Comprehensive Indian State & Union Territory Dictionary
 INDIAN_STATES = {
     "Andhra Pradesh": {"hi": "आंध्र प्रदेश", "bn": "অন্ধ্রপ্রদেশ"},
     "Arunachal Pradesh": {"hi": "अरुणाचल प्रदेश", "bn": "অরুণাচল প্রদেশ"},
@@ -85,9 +90,9 @@ INDIAN_STATES = {
     "Rajasthan": {"hi": "राजस्थान", "bn": "রাজস্থান"},
     "Sikkim": {"hi": "सिक्किम", "bn": "সিকিম"},
     "Tamil Nadu": {"hi": "तमिलनाडु", "bn": "তামিলনাড়ু"},
-    "Telangana": {"hi": "तेलंगाना", "bn": "তেলেঙ্গানা"},
+    "Telangana": {"hi": "तेलंगाना", "bn": "तेलेंगाना"},
     "Tripura": {"hi": "त्रिपुरा", "bn": "ত্রিপুরা"},
-    "Uttar Pradesh": {"hi": "उत्तर प्रदेश", "bn": "উত্তরপ্রদেশ"},
+    "Uttar Pradesh": {"hi": "उत्तर प्रदेश", "bn": "उत्तरप्रदेश"},
     "Uttarakhand": {"hi": "उत्तराखंड", "bn": "উত্তরাখণ্ড"},
     "West Bengal": {"hi": "पश्चिम बंगाल", "bn": "পশ্চিমবঙ্গ"},
     "Delhi": {"hi": "दिल्ली", "bn": "দিল্লি"},
@@ -97,10 +102,20 @@ INDIAN_STATES = {
     "Chandigarh": {"hi": "चंडीगढ़", "bn": "চণ্ডীগড়"}
 }
 
+def validate_unicode_script(text: str, lang: str) -> bool:
+    """Hard guardrail validating that generated text contains correct script characters."""
+    if not text or not isinstance(text, str):
+        return False
+    if lang == "bn":
+        return bool(BENGALI_SCRIPT_REGEX.search(text))
+    elif lang == "hi":
+        return bool(DEVANAGARI_SCRIPT_REGEX.search(text))
+    return False
+
 def parse_english_description(en_desc: str) -> Optional[Tuple[str, str]]:
     """
     Parses English description ('en') to extract entity type and state.
-    Returns (type, state) or None if no match.
+    Returns Tuple of (entity_type, state_name) or None.
     """
     if not en_desc or not isinstance(en_desc, str):
         return None
@@ -158,7 +173,7 @@ def generate_localized_descriptions(entity_type: str, state_name: str) -> Option
 
     return None
 
-class HighThroughputWikidataBot:
+class WikidataAutomationEngine:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
@@ -213,7 +228,7 @@ class HighThroughputWikidataBot:
 
                 if res.status_code in (429, 500, 502, 503, 504):
                     wait_t = float(res.headers.get("Retry-After", backoff))
-                    logger.warning(f"[HTTP {res.status_code}] Rate limited. Pausing for {wait_t:.2f}s...")
+                    logger.warning(f"[HTTP {res.status_code}] Rate limited. Backing off for {wait_t:.2f}s...")
                     time.sleep(wait_t)
                     backoff *= 2.0
                     continue
@@ -250,9 +265,7 @@ class HighThroughputWikidataBot:
         return {}
 
     def login(self) -> bool:
-        """
-        Performs 2-Stage MediaWiki Authentication and fetches CSRF token ONCE for session reuse.
-        """
+        """Performs 2-Stage MediaWiki Authentication and stores CSRF token ONCE for session reuse."""
         logger.info(f"[Auth] Authenticating as bot user: '{BOT_USER}'...")
         res_token = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "login"})
         login_token = res_token.get("query", {}).get("tokens", {}).get("logintoken")
@@ -270,8 +283,6 @@ class HighThroughputWikidataBot:
             raise RuntimeError(f"Login failed: {login_res}")
 
         logger.info("[Auth] Successfully authenticated with MediaWiki Action API.")
-        
-        # Fetch one-time CSRF token for the session
         self.refresh_csrf_token()
         return True
 
@@ -289,7 +300,7 @@ class HighThroughputWikidataBot:
         return token
 
     def fetch_sparql_batch(self) -> List[str]:
-        """Queries Wikidata SPARQL endpoint with automatic MediaWiki API random entity fallback."""
+        """Queries SPARQL Query Service with automatic MediaWiki API random generator fallback."""
         queries = [
             """
             SELECT ?item WHERE {
@@ -341,7 +352,7 @@ class HighThroughputWikidataBot:
         params = {
             "action": "wbgetentities",
             "ids": "|".join(qids_chunk[:BATCH_FETCH_SIZE]),
-            "props": "labels|descriptions",
+            "props": "descriptions",
             "languages": "en|bn|hi"
         }
         res = self.request_mediawiki("GET", params=params)
@@ -349,8 +360,8 @@ class HighThroughputWikidataBot:
 
     def process_item_atomic(self, qid: str, entity_data: dict) -> bool:
         """
-        Idempotency check & Single Atomic Write (`action=wbeditentity`).
-        Combines all missing Bengali and Hindi labels/descriptions into ONE single POST request.
+        Idempotency Check & Atomic Update (`action=wbeditentity`).
+        Strictly edits ONLY localized descriptions. NO LABELS ARE EVER TOUCHED.
         """
         if qid in self.completed_qids:
             return False
@@ -359,37 +370,49 @@ class HighThroughputWikidataBot:
             self._mark_completed(qid)
             return False
 
-        labels = entity_data.get("labels", {})
         descriptions = entity_data.get("descriptions", {})
+        en_desc_obj = descriptions.get("en", {})
+        en_desc = en_desc_obj.get("value", "").strip() if isinstance(en_desc_obj, dict) else ""
 
-        en_label = labels.get("en", {}).get("value", "").strip() if isinstance(labels.get("en"), dict) else ""
-        en_desc = descriptions.get("en", {}).get("value", "").strip() if isinstance(descriptions.get("en"), dict) else ""
-
-        # Prepare Atomic Data Payload (Only set descriptions when state NLP matches)
-        edit_payload_data = {"descriptions": {}}
-        fields_updated = []
-
-        # Descriptions check (bn, hi) - strictly state-aware & grammatically natural
-        if en_desc:
-            parsed = parse_english_description(en_desc)
-            if parsed:
-                entity_type, state_name = parsed
-                localized_descs = generate_localized_descriptions(entity_type, state_name)
-                if localized_descs:
-                    if "bn" not in descriptions and "bn" in localized_descs:
-                        edit_payload_data["descriptions"]["bn"] = {"language": "bn", "value": localized_descs["bn"]}
-                        fields_updated.append("bn_desc")
-                    if "hi" not in descriptions and "hi" in localized_descs:
-                        edit_payload_data["descriptions"]["hi"] = {"language": "hi", "value": localized_descs["hi"]}
-                        fields_updated.append("hi_desc")
-
-        # Clean empty fields from payload
-        if not edit_payload_data["descriptions"]:
-            del edit_payload_data["descriptions"]
-
-        if not edit_payload_data:
+        if not en_desc:
             self._mark_completed(qid)
             return False
+
+        parsed = parse_english_description(en_desc)
+        if not parsed:
+            self._mark_completed(qid)
+            return False
+
+        entity_type, state_name = parsed
+        localized_descs = generate_localized_descriptions(entity_type, state_name)
+
+        if not localized_descs:
+            self._mark_completed(qid)
+            return False
+
+        # Prepare Descriptions-Only Atomic Data Payload (NO LABELS)
+        edit_payload_descriptions = {}
+        fields_updated = []
+
+        # 1. Bengali Description Check
+        if "bn" not in descriptions and "bn" in localized_descs:
+            bn_val = localized_descs["bn"]
+            if validate_unicode_script(bn_val, "bn"):
+                edit_payload_descriptions["bn"] = {"language": "bn", "value": bn_val}
+                fields_updated.append("bn_desc")
+
+        # 2. Hindi Description Check
+        if "hi" not in descriptions and "hi" in localized_descs:
+            hi_val = localized_descs["hi"]
+            if validate_unicode_script(hi_val, "hi"):
+                edit_payload_descriptions["hi"] = {"language": "hi", "value": hi_val}
+                fields_updated.append("hi_desc")
+
+        if not edit_payload_descriptions:
+            self._mark_completed(qid)
+            return False
+
+        atomic_payload = {"descriptions": edit_payload_descriptions}
 
         # Execute Single Atomic POST Edit via action=wbeditentity
         if not self.csrf_token:
@@ -399,7 +422,7 @@ class HighThroughputWikidataBot:
         post_data = {
             "action": "wbeditentity",
             "id": qid,
-            "data": json.dumps(edit_payload_data, ensure_ascii=False),
+            "data": json.dumps(atomic_payload, ensure_ascii=False),
             "summary": EDIT_SUMMARY,
             "token": self.csrf_token,
             "bot": "1"
@@ -419,11 +442,11 @@ class HighThroughputWikidataBot:
 
 def main():
     logger.info("==========================================================")
-    logger.info(" Starting High-Throughput Production Wikidata Bot ")
-    logger.info(" Mode: Atomic wbeditentity | Batch: 50 | Delay: 1.8s ")
+    logger.info(" Starting Wikidata Production Automation Engine (bot.py) ")
+    logger.info(" Mode: Descriptions-Only | Batch: 50 | Delay: 1.8s ")
     logger.info("==========================================================")
 
-    bot = HighThroughputWikidataBot()
+    bot = WikidataAutomationEngine()
 
     try:
         bot.login()
@@ -431,18 +454,13 @@ def main():
         logger.critical(f"[Fatal] Authentication failed: {e}")
         sys.exit(1)
 
-    # Infinite / Continuous Pipeline Loop
+    # 24/7 Continuous Execution Pipeline
     while True:
-        logger.info("[SPARQL] Querying target items batch...")
         qids = bot.fetch_sparql_batch()
-        logger.info(f"[SPARQL] Retrieved {len(qids)} items from SPARQL query.")
-
         pending_qids = [q for q in qids if q.upper() not in bot.completed_qids]
-        logger.info(f"[Pipeline] {len(pending_qids)} pending QIDs to process.")
 
         if not pending_qids:
-            logger.info("[Pipeline] All retrieved QIDs processed. Sleeping 10s before next SPARQL fetch...")
-            time.sleep(10)
+            time.sleep(5)
             continue
 
         # Process in batch chunks of 50 QIDs
@@ -455,7 +473,7 @@ def main():
                 try:
                     bot.process_item_atomic(qid, entity_data)
                 except KeyboardInterrupt:
-                    logger.info("\n[!] User interrupted execution.")
+                    logger.info("\n[!] Shutdown requested. Exiting cleanly.")
                     sys.exit(0)
                 except Exception as e:
                     logger.error(f"QID: {qid} | Error: {e}")
