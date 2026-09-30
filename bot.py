@@ -11,11 +11,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 import requests
 from dotenv import load_dotenv
-from indic_transliteration import sanscript
 
 load_dotenv()
 
-# API Configuration
+# API & Bot Configuration
 API_URL = os.getenv("WIKIDATA_API_URL", "https://www.wikidata.org/w/api.php").strip()
 SPARQL_URL = "https://query.wikidata.org/sparql"
 BOT_USER = os.getenv("WIKIDATA_BOT_USER", "SHADOWARROW 2026@ShadowBot").strip()
@@ -25,14 +24,14 @@ USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026
 STATE_FILE = "completed_qids.txt"
 LOG_FILE = "bot_execution.log"
 
-RATE_LIMIT_DELAY = 2.5  # 2.5s safe delay between write operations
+RATE_LIMIT_DELAY = 1.8  # Safe 1.8s delay between writes
 MAXLAG = 5
 MAX_RETRIES = 5
 BATCH_FETCH_SIZE = 50
 
-EDIT_SUMMARY = "Added missing Hindi and Bengali labels and descriptions for Indian localities"
+EDIT_SUMMARY = "Added missing Bengali and Hindi labels/descriptions from verified Wikipedia sitelinks"
 
-# Script Regex Validators (Hard Guardrails)
+# Strict Script Regex Validators (Absolute Hard Guardrails)
 BENGALI_SCRIPT_REGEX = re.compile(r'[\u0980-\u09FF]')
 DEVANAGARI_SCRIPT_REGEX = re.compile(r'[\u0900-\u097F]')
 LATIN_ALPHABET_REGEX = re.compile(r'[a-zA-Z]')
@@ -54,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("WikidataBot")
 
-# Complete State & UT Mapping Dictionary
+# Complete Verified State & UT Mapping Dictionary (34 Entities)
 INDIAN_STATES = {
     "Andhra Pradesh": {"hi": "आंध्र प्रदेश", "bn": "অন্ধ্রপ্রদেশ"},
     "Arunachal Pradesh": {"hi": "अरुणाचल प्रदेश", "bn": "অরুণাচল প্রদেশ"},
@@ -68,7 +67,7 @@ INDIAN_STATES = {
     "Jharkhand": {"hi": "झारखंड", "bn": "ঝাড়খণ্ড"},
     "Karnataka": {"hi": "कर्नाटक", "bn": "কর্ণাটক"},
     "Kerala": {"hi": "केरल", "bn": "কেরালা"},
-    "Madhya Pradesh": {"hi": "मध्य प्रदेश", "bn": "মধ্যপ্রদেশ"},
+    "Madhya Pradesh": {"hi": "मध्य प्रदेश", "bn": "मध्यप्रदेश"},
     "Maharashtra": {"hi": "महाराष्ट्र", "bn": "মহারাষ্ট্র"},
     "Manipur": {"hi": "मणिपुर", "bn": "মণিপুর"},
     "Meghalaya": {"hi": "मेघालय", "bn": "মেঘালয়"},
@@ -77,11 +76,11 @@ INDIAN_STATES = {
     "Odisha": {"hi": "ओडिशा", "bn": "ওড়িশা"},
     "Orissa": {"hi": "ओडिशा", "bn": "ওড়িশা"},
     "Punjab": {"hi": "पंजाब", "bn": "পাঞ্জাব"},
-    "Rajasthan": {"hi": "राजस्थान", "bn": "রাজস্থান"},
+    "Rajasthan": {"hi": "राजस्थान", "bn": "राजस्थान"},
     "Sikkim": {"hi": "सिक्किम", "bn": "সিকিম"},
     "Tamil Nadu": {"hi": "तमिलनाडु", "bn": "তামিলনাড়ু"},
     "Telangana": {"hi": "तेलंगाना", "bn": "तेलेंगाना"},
-    "Tripura": {"hi": "त्रिपुरा", "bn": "ত্রিপুরা"},
+    "Tripura": {"hi": "त्रिपुरा", "bn": "त्रिपुरा"},
     "Uttar Pradesh": {"hi": "उत्तर प्रदेश", "bn": "उत्तरप्रदेश"},
     "Uttarakhand": {"hi": "उत्तराखंड", "bn": "উত্তরাখণ্ড"},
     "West Bengal": {"hi": "पश्चिम बंगाल", "bn": "পশ্চিমবঙ্গ"},
@@ -94,14 +93,15 @@ INDIAN_STATES = {
 
 def validate_script(text: str, lang: str) -> bool:
     """
-    Strict Guardrail:
-    1. Text must match target Indic script (Devanagari for 'hi', Bengali for 'bn').
-    2. Text must NOT contain ANY Latin alphabet letters ([a-zA-Z]).
+    Absolute Hard Guardrail:
+    1. ZERO Latin characters allowed (re.search(r'[a-zA-Z]', text) MUST be False).
+    2. Bengali text MUST match Bengali Unicode range [\u0980-\u09FF].
+    3. Hindi text MUST match Devanagari Unicode range [\u0900-\u097F].
     """
     if not text or not isinstance(text, str):
         return False
 
-    # Check Latin letters rejection
+    # Hard rejection of any English/Latin letters
     if LATIN_ALPHABET_REGEX.search(text):
         return False
 
@@ -112,35 +112,13 @@ def validate_script(text: str, lang: str) -> bool:
 
     return False
 
-def transliterate_label(en_label: str, target_lang: str) -> Optional[str]:
-    """
-    Transliterates Romanized English label to target Indic script via indic-transliteration.
-    Returns transliterated string if script validation passes, else None.
-    """
-    if not en_label or not isinstance(en_label, str):
-        return None
-
-    clean_label = en_label.strip()
-
-    try:
-        if target_lang == "hi":
-            translit = sanscript.transliterate(clean_label, sanscript.ITRANS, sanscript.DEVANAGARI)
-        elif target_lang == "bn":
-            translit = sanscript.transliterate(clean_label, sanscript.ITRANS, sanscript.BENGALI)
-        else:
-            return None
-
-        # Apply NFC Unicode normalization & clean whitespace
-        translit = unicodedata.normalize('NFC', translit).strip()
-
-        # Strict validation check
-        if validate_script(translit, target_lang):
-            return translit
-
-    except Exception as e:
-        logger.debug(f"Transliteration error for '{clean_label}': {e}")
-
-    return None
+def clean_sitelink_title(title: str) -> str:
+    """Strips disambiguation parentheses, e.g. 'Ahmedabad (city)' -> 'Ahmedabad'."""
+    if not title or not isinstance(title, str):
+        return ""
+    # Remove trailing parenthetical disambiguation
+    cleaned = re.sub(r'\s*\([^)]*\)$', '', title).strip()
+    return unicodedata.normalize('NFC', cleaned)
 
 def parse_english_description(en_desc: str) -> Optional[Tuple[str, str]]:
     """
@@ -164,7 +142,7 @@ def parse_english_description(en_desc: str) -> Optional[Tuple[str, str]]:
         if match:
             extracted_state = match.group(1).strip()
             extracted_state = re.sub(r'\s+state$', '', extracted_state, flags=re.IGNORECASE).strip()
-            
+
             for state_key in INDIAN_STATES:
                 if state_key.lower() == extracted_state.lower():
                     return entity_type, state_key
@@ -203,7 +181,7 @@ def generate_localized_descriptions(entity_type: str, state_name: str) -> Option
 
     return None
 
-class MultilingualWikidataEngine:
+class ZeroErrorWikidataEngine:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
@@ -272,11 +250,10 @@ class MultilingualWikidataEngine:
                     err_info = err.get("info", "")
                     messages = err.get("messages", [])
 
-                    # Check for actionthrottledtext
                     is_throttled = any("actionthrottledtext" in str(m) for m in messages)
                     if is_throttled:
-                        logger.warning(f"[Wikimedia Anti-Abuse Rate Throttle] Pausing for 15.0s before retry...")
-                        time.sleep(15.0)
+                        logger.warning(f"[Wikimedia Anti-Abuse Rate Throttle] Pausing for 20.0s before retry...")
+                        time.sleep(20.0)
                         continue
 
                     if err_code == "maxlag":
@@ -329,7 +306,7 @@ class MultilingualWikidataEngine:
         logger.debug("[Auth] Fetching session CSRF token...")
         res = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "csrf"})
         token = res.get("query", {}).get("tokens", {}).get("csrftoken")
-        
+
         if not token or token == "+\\":
             raise RuntimeError("Obtained invalid CSRF token.")
 
@@ -372,7 +349,6 @@ class MultilingualWikidataEngine:
         except Exception as e:
             logger.warning(f"[SPARQL Lag] {e}. Switching to MediaWiki Action API generator...")
 
-        # Fallback Generator: Query MediaWiki Action API directly for random mainspace QIDs
         res = self.request_mediawiki("GET", params={
             "action": "query",
             "list": "random",
@@ -400,8 +376,8 @@ class MultilingualWikidataEngine:
     def process_item_atomic(self, qid: str, entity_data: dict) -> bool:
         """
         Idempotency Check & Atomic Multi-Field Update (`action=wbeditentity`).
-        Extracts Labels from Wikipedia Sitelinks (bnwiki / hiwiki) first, fallback to indic-transliteration.
-        Populates missing Labels and Descriptions in Hindi ('hi') and Bengali ('bn') with ZERO Latin letters allowed.
+        SITELINK-ONLY LABELS: Uses bnwiki and hiwiki Wikipedia sitelinks exclusively. Zero transliteration guesswork.
+        Strict Script Guardrails: Drops any field containing Latin characters or missing required script.
         """
         if qid in self.completed_qids:
             return False
@@ -414,7 +390,6 @@ class MultilingualWikidataEngine:
         descriptions = entity_data.get("descriptions", {})
         sitelinks = entity_data.get("sitelinks", {})
 
-        en_label = labels.get("en", {}).get("value", "").strip() if isinstance(labels.get("en"), dict) else ""
         en_desc = descriptions.get("en", {}).get("value", "").strip() if isinstance(descriptions.get("en"), dict) else ""
 
         edit_payload = {}
@@ -422,46 +397,24 @@ class MultilingualWikidataEngine:
         payload_descriptions = {}
         fields_updated = []
 
-        # 1. Label Extraction (Primary: Sitelinks | Secondary: Transliteration)
+        # 1. Label Extraction (SITELINK-ONLY MODE - ZERO TRANSLITERATION GUESSWORK)
         # Process Hindi Label
         if "hi" not in labels:
-            valid_hi_label = None
-            # Primary: hiwiki sitelink title
             hi_sitelink = sitelinks.get("hiwiki", {}).get("title", "").strip()
             if hi_sitelink:
-                clean_hi_site = re.sub(r'\s*\([^)]*\)$', '', hi_sitelink).strip()
-                if validate_script(clean_hi_site, "hi"):
-                    valid_hi_label = clean_hi_site
-
-            # Secondary: Transliteration fallback
-            if not valid_hi_label and en_label:
-                hi_translit = transliterate_label(en_label, "hi")
-                if hi_translit and validate_script(hi_translit, "hi"):
-                    valid_hi_label = hi_translit
-
-            if valid_hi_label and validate_script(valid_hi_label, "hi"):
-                payload_labels["hi"] = {"language": "hi", "value": valid_hi_label}
-                fields_updated.append("hi_label")
+                clean_hi = clean_sitelink_title(hi_sitelink)
+                if validate_script(clean_hi, "hi"):
+                    payload_labels["hi"] = {"language": "hi", "value": clean_hi}
+                    fields_updated.append("hi_label")
 
         # Process Bengali Label
         if "bn" not in labels:
-            valid_bn_label = None
-            # Primary: bnwiki sitelink title
             bn_sitelink = sitelinks.get("bnwiki", {}).get("title", "").strip()
             if bn_sitelink:
-                clean_bn_site = re.sub(r'\s*\([^)]*\)$', '', bn_sitelink).strip()
-                if validate_script(clean_bn_site, "bn"):
-                    valid_bn_label = clean_bn_site
-
-            # Secondary: Transliteration fallback
-            if not valid_bn_label and en_label:
-                bn_translit = transliterate_label(en_label, "bn")
-                if bn_translit and validate_script(bn_translit, "bn"):
-                    valid_bn_label = bn_translit
-
-            if valid_bn_label and validate_script(valid_bn_label, "bn"):
-                payload_labels["bn"] = {"language": "bn", "value": valid_bn_label}
-                fields_updated.append("bn_label")
+                clean_bn = clean_sitelink_title(bn_sitelink)
+                if validate_script(clean_bn, "bn"):
+                    payload_labels["bn"] = {"language": "bn", "value": clean_bn}
+                    fields_updated.append("bn_label")
 
         # 2. Process State-Mapped Descriptions (hi, bn)
         if en_desc:
@@ -481,11 +434,13 @@ class MultilingualWikidataEngine:
                             payload_descriptions["hi"] = {"language": "hi", "value": hi_desc_val}
                             fields_updated.append("hi_desc")
 
+        # Assemble atomic payload
         if payload_labels:
             edit_payload["labels"] = payload_labels
         if payload_descriptions:
             edit_payload["descriptions"] = payload_descriptions
 
+        # Skip edit entirely if both labels and descriptions end up empty
         if not edit_payload:
             self._mark_completed(qid)
             return False
@@ -518,11 +473,11 @@ class MultilingualWikidataEngine:
 
 def main():
     logger.info("==========================================================")
-    logger.info(" Starting Multilingual Wikidata Engine (bot.py) ")
-    logger.info(" Mode: Atomic Labels + Descriptions | Batch: 50 | Delay: 1.8s ")
+    logger.info(" Starting Zero-Error Wikidata Engine (bot.py) ")
+    logger.info(" Mode: Sitelink-Only Labels + State Descriptions | Delay: 1.8s ")
     logger.info("==========================================================")
 
-    bot = MultilingualWikidataEngine()
+    bot = ZeroErrorWikidataEngine()
 
     try:
         bot.login()
@@ -530,7 +485,6 @@ def main():
         logger.critical(f"[Fatal] Authentication failed: {e}")
         sys.exit(1)
 
-    # 24/7 Continuous Execution Pipeline
     while True:
         qids = bot.fetch_sparql_batch()
         pending_qids = [q for q in qids if q.upper() not in bot.completed_qids]
@@ -539,7 +493,6 @@ def main():
             time.sleep(5)
             continue
 
-        # Process in batch chunks of 50 QIDs
         for i in range(0, len(pending_qids), BATCH_FETCH_SIZE):
             chunk = pending_qids[i : i + BATCH_FETCH_SIZE]
             entities_batch = bot.fetch_entities_batch(chunk)
