@@ -365,20 +365,11 @@ class HighThroughputWikidataBot:
         en_label = labels.get("en", {}).get("value", "").strip() if isinstance(labels.get("en"), dict) else ""
         en_desc = descriptions.get("en", {}).get("value", "").strip() if isinstance(descriptions.get("en"), dict) else ""
 
-        # Prepare Atomic Data Payload
-        edit_payload_data = {"labels": {}, "descriptions": {}}
+        # Prepare Atomic Data Payload (Only set descriptions when state NLP matches)
+        edit_payload_data = {"descriptions": {}}
         fields_updated = []
 
-        # 1. Labels check (bn, hi)
-        if en_label:
-            if "bn" not in labels:
-                edit_payload_data["labels"]["bn"] = {"language": "bn", "value": en_label}
-                fields_updated.append("bn_label")
-            if "hi" not in labels:
-                edit_payload_data["labels"]["hi"] = {"language": "hi", "value": en_label}
-                fields_updated.append("hi_label")
-
-        # 2. Descriptions check (bn, hi)
+        # Descriptions check (bn, hi) - strictly state-aware & grammatically natural
         if en_desc:
             parsed = parse_english_description(en_desc)
             if parsed:
@@ -393,8 +384,6 @@ class HighThroughputWikidataBot:
                         fields_updated.append("hi_desc")
 
         # Clean empty fields from payload
-        if not edit_payload_data["labels"]:
-            del edit_payload_data["labels"]
         if not edit_payload_data["descriptions"]:
             del edit_payload_data["descriptions"]
 
