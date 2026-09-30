@@ -383,14 +383,15 @@ class MultilingualWikidataEngine:
         return [item["title"] for item in random_items if item.get("title", "").startswith("Q")]
 
     def fetch_entities_batch(self, qids_chunk: List[str]) -> Dict[str, Any]:
-        """Fetches up to 50 QIDs in a SINGLE HTTP GET query using action=wbgetentities."""
+        """Fetches up to 50 QIDs in a SINGLE HTTP GET query using action=wbgetentities with sitelinks."""
         if not qids_chunk:
             return {}
 
         params = {
             "action": "wbgetentities",
             "ids": "|".join(qids_chunk[:BATCH_FETCH_SIZE]),
-            "props": "labels|descriptions",
+            "props": "labels|descriptions|sitelinks",
+            "sitefilter": "bnwiki|hiwiki",
             "languages": "en|bn|hi"
         }
         res = self.request_mediawiki("GET", params=params)
@@ -399,8 +400,8 @@ class MultilingualWikidataEngine:
     def process_item_atomic(self, qid: str, entity_data: dict) -> bool:
         """
         Idempotency Check & Atomic Multi-Field Update (`action=wbeditentity`).
-        Populates BOTH missing Labels and Descriptions in Hindi ('hi') and Bengali ('bn').
-        Applies strict script validation and transliteration guardrails.
+        Extracts Labels from Wikipedia Sitelinks (bnwiki / hiwiki) first, fallback to indic-transliteration.
+        Populates missing Labels and Descriptions in Hindi ('hi') and Bengali ('bn') with ZERO Latin letters allowed.
         """
         if qid in self.completed_qids:
             return False
@@ -411,26 +412,56 @@ class MultilingualWikidataEngine:
 
         labels = entity_data.get("labels", {})
         descriptions = entity_data.get("descriptions", {})
+        sitelinks = entity_data.get("sitelinks", {})
 
         en_label = labels.get("en", {}).get("value", "").strip() if isinstance(labels.get("en"), dict) else ""
         en_desc = descriptions.get("en", {}).get("value", "").strip() if isinstance(descriptions.get("en"), dict) else ""
 
-        edit_payload = {"labels": {}, "descriptions": {}}
+        edit_payload = {}
+        payload_labels = {}
+        payload_descriptions = {}
         fields_updated = []
 
-        # 1. Process Transliterated Labels (hi, bn)
-        if en_label:
-            if "hi" not in labels:
+        # 1. Label Extraction (Primary: Sitelinks | Secondary: Transliteration)
+        # Process Hindi Label
+        if "hi" not in labels:
+            valid_hi_label = None
+            # Primary: hiwiki sitelink title
+            hi_sitelink = sitelinks.get("hiwiki", {}).get("title", "").strip()
+            if hi_sitelink:
+                clean_hi_site = re.sub(r'\s*\([^)]*\)$', '', hi_sitelink).strip()
+                if validate_script(clean_hi_site, "hi"):
+                    valid_hi_label = clean_hi_site
+
+            # Secondary: Transliteration fallback
+            if not valid_hi_label and en_label:
                 hi_translit = transliterate_label(en_label, "hi")
                 if hi_translit and validate_script(hi_translit, "hi"):
-                    edit_payload["labels"]["hi"] = {"language": "hi", "value": hi_translit}
-                    fields_updated.append("hi_label")
+                    valid_hi_label = hi_translit
 
-            if "bn" not in labels:
+            if valid_hi_label and validate_script(valid_hi_label, "hi"):
+                payload_labels["hi"] = {"language": "hi", "value": valid_hi_label}
+                fields_updated.append("hi_label")
+
+        # Process Bengali Label
+        if "bn" not in labels:
+            valid_bn_label = None
+            # Primary: bnwiki sitelink title
+            bn_sitelink = sitelinks.get("bnwiki", {}).get("title", "").strip()
+            if bn_sitelink:
+                clean_bn_site = re.sub(r'\s*\([^)]*\)$', '', bn_sitelink).strip()
+                if validate_script(clean_bn_site, "bn"):
+                    valid_bn_label = clean_bn_site
+
+            # Secondary: Transliteration fallback
+            if not valid_bn_label and en_label:
                 bn_translit = transliterate_label(en_label, "bn")
                 if bn_translit and validate_script(bn_translit, "bn"):
-                    edit_payload["labels"]["bn"] = {"language": "bn", "value": bn_translit}
-                    fields_updated.append("bn_label")
+                    valid_bn_label = bn_translit
+
+            if valid_bn_label and validate_script(valid_bn_label, "bn"):
+                payload_labels["bn"] = {"language": "bn", "value": valid_bn_label}
+                fields_updated.append("bn_label")
 
         # 2. Process State-Mapped Descriptions (hi, bn)
         if en_desc:
@@ -442,19 +473,18 @@ class MultilingualWikidataEngine:
                     if "bn" not in descriptions and "bn" in localized_descs:
                         bn_desc_val = localized_descs["bn"]
                         if validate_script(bn_desc_val, "bn"):
-                            edit_payload["descriptions"]["bn"] = {"language": "bn", "value": bn_desc_val}
+                            payload_descriptions["bn"] = {"language": "bn", "value": bn_desc_val}
                             fields_updated.append("bn_desc")
                     if "hi" not in descriptions and "hi" in localized_descs:
                         hi_desc_val = localized_descs["hi"]
                         if validate_script(hi_desc_val, "hi"):
-                            edit_payload["descriptions"]["hi"] = {"language": "hi", "value": hi_desc_val}
+                            payload_descriptions["hi"] = {"language": "hi", "value": hi_desc_val}
                             fields_updated.append("hi_desc")
 
-        # Clean empty sections
-        if not edit_payload["labels"]:
-            del edit_payload["labels"]
-        if not edit_payload["descriptions"]:
-            del edit_payload["descriptions"]
+        if payload_labels:
+            edit_payload["labels"] = payload_labels
+        if payload_descriptions:
+            edit_payload["descriptions"] = payload_descriptions
 
         if not edit_payload:
             self._mark_completed(qid)
