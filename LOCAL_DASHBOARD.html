@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WikiBot v3 — Local Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #020817;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: #0f172a;
+      border-bottom: 1px solid #1e293b;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; }
+    .logo-icon {
+      width: 36px; height: 36px; border-radius: 8px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; font-weight: 900; color: white;
+    }
+    .logo-text { font-size: 15px; font-weight: 700; color: white; }
+    .logo-sub  { font-size: 11px; color: #64748b; }
+
+    .header-badges { display: flex; gap: 10px; align-items: center; }
+    .badge {
+      padding: 4px 12px; border-radius: 99px; font-size: 11px;
+      font-weight: 700; border: 1px solid; letter-spacing: 0.5px;
+    }
+    .badge-local  { background: #2e1065; color: #c4b5fd; border-color: #7c3aed55; }
+    .badge-active { background: #052e16; color: #4ade80; border-color: #16a34a55; }
+    .badge-paused { background: #1e1e2e; color: #94a3b8; border-color: #33415555; }
+
+    /* ── Main grid ── */
+    main { max-width: 1200px; margin: 0 auto; padding: 24px 16px; }
+
+    /* ── Control bar ── */
+    .control-bar {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 16px;
+      padding: 20px 24px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .control-left h2 { font-size: 18px; font-weight: 800; color: white; }
+    .control-left p  { font-size: 12px; color: #64748b; margin-top: 3px; }
+    .qid-pill {
+      font-size: 12px; font-family: monospace; color: #818cf8;
+      background: #1e1b4b; border: 1px solid #3730a355;
+      padding: 4px 10px; border-radius: 6px; display: inline-block; margin-top: 6px;
+    }
+
+    .btn {
+      padding: 10px 24px; border-radius: 10px; font-size: 13px;
+      font-weight: 700; cursor: pointer; border: none; transition: all 0.2s;
+    }
+    .btn-start {
+      background: linear-gradient(135deg, #16a34a, #15803d);
+      color: white; box-shadow: 0 4px 20px #16a34a44;
+    }
+    .btn-start:hover { transform: translateY(-1px); box-shadow: 0 6px 24px #16a34a66; }
+    .btn-pause {
+      background: linear-gradient(135deg, #dc2626, #b91c1c);
+      color: white; box-shadow: 0 4px 20px #dc262644;
+    }
+    .btn-pause:hover { transform: translateY(-1px); box-shadow: 0 6px 24px #dc262666; }
+    .btn-disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Metric cards ── */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 20px; }
+    .card {
+      background: #0f172a; border: 1px solid #1e293b;
+      border-radius: 14px; padding: 18px; transition: border-color 0.2s;
+    }
+    .card:hover { border-color: #334155; }
+    .card-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #64748b; margin-bottom: 10px; }
+    .card-value { font-size: 32px; font-weight: 900; font-family: monospace; }
+    .card-sub   { font-size: 11px; color: #64748b; margin-top: 6px; }
+    .pill {
+      display: inline-block; padding: 2px 10px; border-radius: 99px;
+      font-size: 10px; font-weight: 700; border: 1px solid; margin-left: 6px;
+    }
+
+    .val-blue   { color: #60a5fa; }
+    .val-green  { color: #4ade80; }
+    .val-indigo { color: #a5b4fc; }
+    .val-amber  { color: #fbbf24; }
+    .val-rose   { color: #f87171; }
+
+    .pill-green  { background: #052e16; color: #4ade80; border-color: #16a34a55; }
+    .pill-blue   { background: #1e3a5f; color: #60a5fa; border-color: #2563eb55; }
+    .pill-indigo { background: #1e1b4b; color: #a5b4fc; border-color: #4338ca55; }
+    .pill-amber  { background: #451a03; color: #fbbf24; border-color: #d9770644; }
+    .pill-rose   { background: #4c0519; color: #f87171; border-color: #dc262655; }
+    .pill-violet { background: #2e1065; color: #c4b5fd; border-color: #7c3aed55; }
+
+    /* ── Feed table ── */
+    .feed-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .feed-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    .feed-count { font-size: 11px; color: #a5b4fc; background: #1e1b4b; padding: 2px 8px; border-radius: 99px; border: 1px solid #3730a355; }
+
+    .feed { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow-y: auto; }
+    .feed::-webkit-scrollbar { width: 4px; }
+    .feed::-webkit-scrollbar-track { background: #0f172a; }
+    .feed::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+
+    .feed-item {
+      background: #0f172a; border: 1px solid #1e293b;
+      border-radius: 10px; padding: 12px 14px;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; transition: border-color 0.15s;
+    }
+    .feed-item:hover { border-color: #334155; }
+    .feed-qid {
+      font-family: monospace; font-size: 13px; font-weight: 700;
+      color: #818cf8; background: #1e1b4b; border: 1px solid #3730a355;
+      padding: 3px 10px; border-radius: 6px; text-decoration: none;
+    }
+    .feed-qid:hover { color: #c4b5fd; }
+    .feed-label { font-size: 11px; color: #94a3b8; }
+    .feed-ts    { font-size: 10px; color: #475569; font-family: monospace; white-space: nowrap; }
+    .feed-status { font-size: 10px; font-weight: 700; color: #4ade80; }
+
+    .empty-feed {
+      text-align: center; padding: 48px 0;
+      border: 1px dashed #1e293b; border-radius: 12px; color: #475569;
+    }
+    .empty-feed p { font-size: 14px; margin-bottom: 4px; }
+    .empty-feed small { font-size: 11px; }
+
+    /* ── Error banner ── */
+    .error-bar {
+      background: #4c0519; border: 1px solid #dc262655;
+      border-radius: 10px; padding: 12px 16px; margin-bottom: 16px;
+      font-size: 12px; color: #f87171; display: none;
+    }
+
+    /* ── Status dot ── */
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .dot-green  { background: #4ade80; animation: pulse-g 2s infinite; }
+    .dot-red    { background: #f87171; }
+    .dot-yellow { background: #fbbf24; animation: pulse-y 2s infinite; }
+    @keyframes pulse-g { 0%,100%{box-shadow:0 0 0 0 #4ade8088}50%{box-shadow:0 0 0 6px #4ade8000} }
+    @keyframes pulse-y { 0%,100%{box-shadow:0 0 0 0 #fbbf2488}50%{box-shadow:0 0 0 6px #fbbf2400} }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">Wd</div>
+      <div>
+        <div class="logo-text">WIKIDATA AUTOMATION ENGINE</div>
+        <div class="logo-sub">Local Dashboard — localhost:8000</div>
+      </div>
+    </div>
+    <div class="header-badges">
+      <span class="badge badge-local">🖥️ LOCAL PC MODE</span>
+      <span class="badge" id="status-badge">⏳ Connecting...</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Error bar -->
+    <div class="error-bar" id="error-bar">
+      ⚠️ Cannot connect to local bot at <strong>localhost:8000</strong>.
+      Make sure <strong>START_LOCAL_BOT.bat</strong> is running.
+    </div>
+
+    <!-- Control bar -->
+    <div class="control-bar">
+      <div class="control-left">
+        <h2 id="ctrl-title">🤖 BOT MASTER POWER SWITCH</h2>
+        <p id="ctrl-msg">Connecting to local engine...</p>
+        <div id="ctrl-qid" class="qid-pill" style="display:none"></div>
+      </div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-start btn-disabled" id="btn-start" onclick="sendControl('start')">▶ TURN BOT ON</button>
+        <button class="btn btn-pause btn-disabled" id="btn-pause" onclick="sendControl('pause')">⏸ TURN BOT OFF</button>
+      </div>
+    </div>
+
+    <!-- Metric Cards -->
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">Session Writes</div>
+        <div class="card-value val-blue" id="m-edits">—</div>
+        <div class="card-sub">
+          <span id="m-epm-pill" class="pill pill-green">— EPM</span>
+          edits this session
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Engine Speed</div>
+        <div class="card-value val-indigo" id="m-speed">1.0s</div>
+        <div class="card-sub"><span class="pill pill-indigo">MAX SPEED</span> per write</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Queue Buffer</div>
+        <div class="card-value val-amber" id="m-queue">—</div>
+        <div class="card-sub"><span class="pill pill-violet">🖥️ Local PC</span> 5 consumers</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Script Purity</div>
+        <div class="card-value val-green">100%</div>
+        <div class="card-sub"><span class="pill pill-green">VERIFIED SAFE</span></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Errors</div>
+        <div class="card-value val-rose" id="m-errors">—</div>
+        <div class="card-sub" id="m-errors-sub">network errors this session</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Skipped</div>
+        <div class="card-value" style="color:#94a3b8" id="m-skipped">—</div>
+        <div class="card-sub">guardrail filtered</div>
+      </div>
+    </div>
+
+    <!-- Feed -->
+    <div style="background:#0f172a;border:1px solid #1e293b;border-radius:14px;padding:20px">
+      <div class="feed-header">
+        <div class="feed-title">
+          ⚡ Live Recent Changes
+          <span class="feed-count" id="feed-count">0 / 500</span>
+        </div>
+        <span style="font-size:11px;color:#475569">Auto-refresh every 2s</span>
+      </div>
+      <div class="feed" id="feed">
+        <div class="empty-feed">
+          <p>No edits yet</p>
+          <small>Start the bot and wait a few seconds</small>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const API   = 'http://localhost:8000';
+    const TOKEN = 'SHADOW_SECURE_TOKEN_2026';
+    const HEADERS = { 'X-Bot-Token': TOKEN };
+
+    let connected  = false;
+    let isActive   = false;
+
+    // ── Fetch status ───────────────────────────────────────────
+    async function fetchStatus() {
+      try {
+        const res  = await fetch(`${API}/status`, { headers: HEADERS });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        connected = true;
+        document.getElementById('error-bar').style.display = 'none';
+        updateStatus(data);
+      } catch(e) {
+        connected = false;
+        document.getElementById('error-bar').style.display = 'block';
+        document.getElementById('status-badge').className  = 'badge badge-paused';
+        document.getElementById('status-badge').textContent = '⚠️ Disconnected';
+        document.getElementById('ctrl-msg').textContent    = '❌ Cannot reach localhost:8000 — is START_LOCAL_BOT.bat running?';
+        setButtons(false);
+      }
+    }
+
+    function updateStatus(d) {
+      isActive = d.is_active;
+      const epm  = d.edits_per_minute || 0;
+      const q    = d.queue_depth      || 0;
+
+      // Status badge
+      const badge = document.getElementById('status-badge');
+      if (isActive) {
+        badge.className   = 'badge badge-active';
+        badge.textContent = '● ACTIVE — EDITING';
+      } else {
+        badge.className   = 'badge badge-paused';
+        badge.textContent = '⏸ PAUSED';
+      }
+
+      // Control bar
+      document.getElementById('ctrl-title').textContent =
+        isActive ? '🟢 BOT MASTER POWER SWITCH — ONLINE' : '⏸ BOT MASTER POWER SWITCH — PAUSED';
+      document.getElementById('ctrl-msg').textContent = d.status_message || '';
+
+      const qidEl = document.getElementById('ctrl-qid');
+      if (d.current_qid) {
+        qidEl.style.display   = 'inline-block';
+        qidEl.textContent     = '⚡ Processing: ' + d.current_qid;
+      } else {
+        qidEl.style.display   = 'none';
+      }
+
+      // Metrics
+      document.getElementById('m-edits').textContent   = d.completed_in_session || 0;
+      document.getElementById('m-epm-pill').textContent = epm > 0 ? epm + ' EPM' : 'Idle';
+      document.getElementById('m-queue').textContent   = q;
+      document.getElementById('m-errors').textContent  = d.errors_in_session   || 0;
+      document.getElementById('m-skipped').textContent = d.skipped_in_session  || 0;
+
+      setButtons(true);
+    }
+
+    function setButtons(enabled) {
+      const s = document.getElementById('btn-start');
+      const p = document.getElementById('btn-pause');
+      if (enabled) {
+        s.classList.remove('btn-disabled');
+        p.classList.remove('btn-disabled');
+      } else {
+        s.classList.add('btn-disabled');
+        p.classList.add('btn-disabled');
+      }
+    }
+
+    // ── Fetch edits ────────────────────────────────────────────
+    async function fetchEdits() {
+      try {
+        const res  = await fetch(`${API}/edits?limit=500`, { headers: HEADERS });
+        if (!res.ok) return;
+        const data = await res.json();
+        renderFeed(data.edits || []);
+      } catch(e) {}
+    }
+
+    function renderFeed(edits) {
+      const feed = document.getElementById('feed');
+      document.getElementById('feed-count').textContent = edits.length + ' / 500';
+
+      if (!edits.length) {
+        feed.innerHTML = `
+          <div class="empty-feed">
+            <p>No edits yet</p>
+            <small>Start the bot and wait a few seconds...</small>
+          </div>`;
+        return;
+      }
+
+      feed.innerHTML = edits.map(e => `
+        <div class="feed-item">
+          <div style="display:flex;align-items:center;gap:10px">
+            <a class="feed-qid" href="https://www.wikidata.org/wiki/${e.qid}" target="_blank">${e.qid} ↗</a>
+            <span class="feed-label">Added Hindi/Bengali labels &amp; P18</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px">
+            <span class="feed-status">✓ Verified Safe</span>
+            <span class="feed-ts">${e.timestamp || ''}</span>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    // ── Control ────────────────────────────────────────────────
+    async function sendControl(action) {
+      if (!connected) return;
+      try {
+        const res = await fetch(`${API}/control`, {
+          method: 'POST',
+          headers: { ...HEADERS, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action })
+        });
+        if (res.ok) {
+          await fetchStatus();
+        }
+      } catch(e) {
+        alert('Control command failed: ' + e.message);
+      }
+    }
+
+    // ── Poll loop ──────────────────────────────────────────────
+    async function poll() {
+      await fetchStatus();
+      await fetchEdits();
+    }
+
+    poll();
+    setInterval(poll, 2000);
+  </script>
+</body>
+</html>

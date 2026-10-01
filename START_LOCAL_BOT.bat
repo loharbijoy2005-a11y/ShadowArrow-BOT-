@@ -33,10 +33,16 @@ echo  [OK] Packages ready.
 REM ── Step 3: Start the bot ─────────────────────────────────────
 echo  [3/3] Starting WikiBot v3...
 echo.
-echo  Dashboard: http://localhost:8000
+echo  ============================================================
+echo  LOCAL DASHBOARD: Open  LOCAL_DASHBOARD.html  in browser
+echo  OR visit:        http://localhost:8000
 echo  Close this window to STOP the bot.
 echo  ============================================================
 echo.
+
+REM Open local dashboard in browser after 3 seconds
+timeout /t 3 /nobreak >nul
+start "" "%~dp0LOCAL_DASHBOARD.html"
 
 python main.py
 
