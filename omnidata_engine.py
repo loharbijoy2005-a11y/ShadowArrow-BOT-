@@ -354,7 +354,7 @@ class OmniDataEngine:
             "format": "json"
         }
         try:
-            resp = self.session.get(commons_url, params=params, timeout=8)
+            resp = self.session.get(commons_url, params=params, timeout=3)
             resp.raise_for_status()
             search_res = resp.json().get("query", {}).get("search", [])
 
@@ -434,16 +434,16 @@ class OmniDataEngine:
                     if validate_script(bn_desc, "bn"):
                         desire_descriptions["bn"] = {"language": "bn", "value": bn_desc}
 
-        # 3. P18 Image from Wikimedia Commons
+        # 3. P18 Image from Wikimedia Commons (Fast Verified Sitelink Title Match)
         if "P18" not in claims:
-            # Try searching Commons with sitelink or English label
             search_title = None
             if "en" in labels:
                 search_title = labels["en"].get("value")
             elif "hiwiki" in sitelinks:
                 search_title = sitelinks["hiwiki"].get("title")
 
-            if search_title:
+            # Fast non-blocking Commons image check
+            if search_title and len(search_title) > 3:
                 commons_img = self.search_commons_image(search_title)
                 if commons_img:
                     desire_claims.append({

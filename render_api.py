@@ -220,6 +220,8 @@ def control_bot(req: ControlRequest, x_bot_token: Optional[str] = Header(None)):
     with state_lock:
         if req.action == "start":
             engine_state["is_active"] = True
+            if engine_instance:
+                engine_instance.producer_finished = False
             engine_state["status_message"] = "Processing Wikidata queue @ 0.8s"
         elif req.action == "pause":
             engine_state["is_active"] = False
