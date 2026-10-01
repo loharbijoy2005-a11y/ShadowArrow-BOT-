@@ -259,8 +259,8 @@ def _build_session() -> requests.Session:
         pool_connections=100,
         pool_maxsize=100,
         max_retries=Retry(
-            total=3,
-            backoff_factor=0.3,
+            total=5,
+            backoff_factor=1.0,
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["GET", "POST"],
         ),
@@ -285,7 +285,7 @@ def _fetch_csrf_token() -> str:
         resp = _session.get(
             API_URL,
             params={"action": "query", "meta": "tokens", "type": "csrf", "format": "json"},
-            timeout=12,
+            timeout=45,
         )
         resp.raise_for_status()
         token = resp.json().get("query", {}).get("tokens", {}).get("csrftoken", "")
@@ -310,7 +310,7 @@ def _login() -> bool:
                 r1 = _session.get(
                     API_URL,
                     params={"action": "query", "meta": "tokens", "type": "login", "format": "json"},
-                    timeout=12,
+                    timeout=45,
                 )
                 r1.raise_for_status()
                 login_token = r1.json().get("query", {}).get("tokens", {}).get("logintoken", "")
@@ -329,7 +329,7 @@ def _login() -> bool:
                         "lgtoken":   login_token,
                         "format":    "json",
                     },
-                    timeout=12,
+                    timeout=45,
                 )
                 r2.raise_for_status()
                 result = r2.json().get("login", {}).get("result", "")
@@ -368,7 +368,7 @@ def _cirrussearch_qids() -> List[str]:
                 "sroffset": sroffset,
                 "format":   "json",
             },
-            timeout=15,
+            timeout=45,
         )
         if resp.status_code != 200:
             logger.warning(f"CirrusSearch HTTP {resp.status_code} for query={query!r}")
@@ -403,7 +403,7 @@ def _fetch_entities(qids: List[str]) -> Dict[str, Any]:
                 "languages": "en|hi|bn",
                 "format":    "json",
             },
-            timeout=15,
+            timeout=45,
         )
         resp.raise_for_status()
         return resp.json().get("entities", {})
@@ -672,7 +672,7 @@ def _consumer_thread() -> None:
         }
 
         try:
-            resp = _session.post(API_URL, data=edit_data, timeout=15)
+            resp = _session.post(API_URL, data=edit_data, timeout=45)
             res  = resp.json()
 
             # ── Success ───────────────────────────────────────────────────────
@@ -745,9 +745,9 @@ def _consumer_thread() -> None:
                     _bot_state["errors_in_session"] += 1
 
         except requests.exceptions.Timeout:
-            logger.warning(f"[{qid}] Request timed out. Will retry next cycle.")
-            with _state_lock:
-                _bot_state["errors_in_session"] += 1
+            logger.warning(f"[{qid}] Request timed out after 45s — re-queuing payload.")
+            _task_queue.put((qid, payload))
+            time.sleep(2.0)
 
         except requests.exceptions.ConnectionError as exc:
             logger.warning(f"[{qid}] Connection error: {exc}. Retrying in 3s.")
@@ -781,7 +781,7 @@ def _pause_render_cloud() -> None:
             f"{render_url}/control",
             headers={"X-Bot-Token": SECRET_KEY},
             json={"action": "pause"},
-            timeout=6,
+            timeout=25,
         )
         if resp.status_code == 200:
             logger.info("✅ RENDER CLOUD BOT SUCCESSFULLY PAUSED! Local PC bot is now primary.")
@@ -952,7 +952,7 @@ def activate_cloud(x_bot_token: Optional[str] = Header(None)):
             f"{render_url}/control",
             headers={"X-Bot-Token": SECRET_KEY},
             json={"action": "start"},
-            timeout=8,
+            timeout=25,
         )
         if resp.status_code == 200:
             cloud_msg = "Render Cloud bot is now ACTIVATED & Editing!"
