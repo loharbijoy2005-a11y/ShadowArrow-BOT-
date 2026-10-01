@@ -165,7 +165,7 @@ def _parse_en_desc(en_desc: str) -> Optional[Tuple[str, Optional[str]]]:
     """
     Strict category parser using word-boundary regex matching.
     Returns (category_code, state_key_or_None) or None if category is unrecognized.
-    Supported categories: university, college, school, station, village, city, tehsil, district.
+    Supported categories: university, college, school, station, constituency, village, city, tehsil, district.
     """
     if not en_desc or not isinstance(en_desc, str):
         return None
@@ -181,6 +181,8 @@ def _parse_en_desc(en_desc: str) -> Optional[Tuple[str, Optional[str]]]:
         cat = "school"
     elif re.search(r"\b(railway station|train station|metro station)\b", desc_lo):
         cat = "station"
+    elif re.search(r"\b(constituency|lok sabha constituency|assembly constituency|parliamentary constituency)\b", desc_lo):
+        cat = "constituency"
     elif re.search(r"\b(village|gram panchayat|revenue village|mouza|hamlet)\b", desc_lo):
         cat = "village"
     elif re.search(r"\b(town|city|municipality|census town|metropolis)\b", desc_lo):
@@ -511,70 +513,59 @@ def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]
         cat, state_key = parsed
         sm = _STATES.get(state_key) if state_key else None
 
-        # Category Templates: (hi_with_state, hi_fallback, bn_with_state, bn_fallback)
-        templates = {
-            "university": (
-                "भारत के {state} राज्य में स्थित एक विश्वविद्यालय",
-                "भारत में स्थित एक विश्वविद्यालय",
-                "ভারতের {state} রাজ্যে অবস্থিত একটি বিশ্ববিদ্যালয়",
-                "ভারতের একটি বিশ্ববিদ্যালয়",
-            ),
-            "college": (
-                "भारत के {state} राज्य में स्थित एक कॉलेज",
-                "भारत में स्थित एक कॉलेज",
-                "ভারতের {state} রাজ্যে অবস্থিত একটি মহাবিদ্যালয়",
-                "ভারতের একটি মহাবিদ্যালয়",
-            ),
-            "school": (
-                "भारत के {state} राज्य में स्थित एक विद्यालय",
-                "भारत में स्थित एक विद्यालय",
-                "ভারতের {state} রাজ্যে অবস্থিত একটি বিদ্যালয়",
-                "ভারতের একটি বিদ্যালয়",
-            ),
-            "station": (
-                "भारत के {state} राज्य में स्थित एक रेलवे स्टेशन",
-                "भारत में स्थित एक रेलवे स्टेशन",
-                "ভারতের {state} রাজ্যে অবস্থিত একটি রেলওয়ে স্টেশন",
-                "ভারতের একটি রেলওয়ে স্টেশন",
-            ),
-            "village": (
-                "भारत के {state} राज्य का एक गाँव",
-                "भारत का एक गाँव",
-                "ভারতের {state} রাজ্যের একটি গ্রাম",
-                "ভারতের একটি গ্রাম",
-            ),
-            "city": (
-                "भारत के {state} राज्य का एक शहर",
-                "भारत का एक शहर",
-                "ভারতের {state} রাজ্যের একটি শহর",
-                "ভারতের একটি শহর",
-            ),
-            "tehsil": (
-                "भारत के {state} राज्य का एक तहसील",
-                "भारत का एक तहसील",
-                "ভারতের {state} রাজ্যের একটি তহশিল",
-                "ভারতের একটি তহশিল",
-            ),
-            "district": (
-                "भारत के {state} राज्य का एक ज़िला",
-                "भारत का एक ज़िला",
-                "ভারতের {state} রাজ্যের একটি जिला",
-                "ভারতের একটি জেলা",
-            ),
-        }
+        # State is MANDATORY — if no state matched, skip description generation to be 100% accurate
+        if sm:
+            templates = {
+                "university": (
+                    "भारत के {state} राज्य में स्थित एक विश्वविद्यालय",
+                    "ভারতের {state} রাজ্যে অবস্থিত একটি বিশ্ববিদ্যালয়",
+                ),
+                "college": (
+                    "भारत के {state} राज्य में स्थित एक कॉलेज",
+                    "ভারতের {state} রাজ্যে অবস্থিত একটি মহাবিদ্যালয়",
+                ),
+                "school": (
+                    "भारत के {state} राज्य में स्थित एक विद्यालय",
+                    "ভারতের {state} রাজ্যে অবস্থিত একটি বিদ্যালয়",
+                ),
+                "station": (
+                    "भारत के {state} राज्य में स्थित एक रेलवे स्टेशन",
+                    "ভারতের {state} রাজ্যে অবস্থিত একটি রেলওয়ে স্টেশন",
+                ),
+                "constituency": (
+                    "भारत के {state} राज्य का एक निर्वाचन क्षेत्र",
+                    "ভারতের {state} রাজ্যের একটি লোকসভা/বিধানসভা কেন্দ্র",
+                ),
+                "village": (
+                    "भारत के {state} राज्य का एक गाँव",
+                    "ভারতের {state} রাজ্যের একটি গ্রাম",
+                ),
+                "city": (
+                    "भारत के {state} राज्य का एक शहर",
+                    "ভারতের {state} রাজ্যের একটি শহর",
+                ),
+                "tehsil": (
+                    "भारत के {state} राज्य का एक तहसील",
+                    "ভারতের {state} রাজ্যের একটি তহশিল",
+                ),
+                "district": (
+                    "भारत के {state} राज्य का एक ज़िला",
+                    "ভারতের {state} রাজ্যের একটি জেলা",
+                ),
+            }
 
-        tmpl = templates.get(cat)
-        if tmpl:
-            hi_w_state, hi_fall, bn_w_state, bn_fall = tmpl
-            if "hi" not in descriptions:
-                hi_desc = hi_w_state.format(state=sm["hi"]) if sm else hi_fall
-                if _script_ok(hi_desc, "hi"):
-                    want_descs["hi"] = {"language": "hi", "value": hi_desc}
+            tmpl = templates.get(cat)
+            if tmpl:
+                hi_w_state, bn_w_state = tmpl
+                if "hi" not in descriptions:
+                    hi_desc = hi_w_state.format(state=sm["hi"])
+                    if _script_ok(hi_desc, "hi"):
+                        want_descs["hi"] = {"language": "hi", "value": hi_desc}
 
-            if "bn" not in descriptions:
-                bn_desc = bn_w_state.format(state=sm["bn"]) if sm else bn_fall
-                if _script_ok(bn_desc, "bn"):
-                    want_descs["bn"] = {"language": "bn", "value": bn_desc}
+                if "bn" not in descriptions:
+                    bn_desc = bn_w_state.format(state=sm["bn"])
+                    if _script_ok(bn_desc, "bn"):
+                        want_descs["bn"] = {"language": "bn", "value": bn_desc}
 
     if not want_labels and not want_descs:
         return None
