@@ -253,7 +253,9 @@ class OmniDataEngine:
         'campus', 'school', 'hospital', 'orchard', 'station', 'police',
         'college', 'temple', 'office', 'bank', 'stadium', 'hotel',
         'restaurant', 'hall', 'building', 'court', 'gate', 'shop', 'farm',
-        'map of', 'location of', 'district'
+        'map of', 'location of', 'district', 'branch', 'memorial', 'tank',
+        'statue', 'stamp', 'logo', 'journal', 'poster', 'svg', 'map', 'flag',
+        'coat of arms', 'seal', 'emblem'
     ]
 
     def search_commons_image(self, title: str) -> Optional[str]:
