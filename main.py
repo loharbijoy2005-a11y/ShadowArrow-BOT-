@@ -60,10 +60,22 @@ USER_AGENT    = os.getenv(
 )
 SECRET_KEY    = os.getenv("INTERNAL_BOT_SECRET", "SHADOW_SECURE_TOKEN_2026")
 
+# ─── Local vs Render mode ─────────────────────────────────────────────────────
+# Render automatically sets the RENDER env var to "true"
+# On your laptop, RENDER is not set → IS_LOCAL = True
+IS_LOCAL   = os.getenv("RENDER", "") == ""
+# Set AUTO_START_BOT=true in .env to skip dashboard and auto-start on laptop
+AUTO_START = os.getenv("AUTO_START_BOT", "false").lower() == "true"
+
+if IS_LOCAL:
+    logger.info("🖥️  LOCAL MODE — running at full 5-thread speed.")
+else:
+    logger.info("☁️  RENDER MODE — running as cloud service.")
+
 # ─── Tuning constants ─────────────────────────────────────────────────────────
 RATE_LIMIT_SEC        = 1.0    # Exact seconds between wbeditentity calls
-QUEUE_MAXSIZE         = 100    # Hard cap on in-flight payload buffer
-QUEUE_REFILL_BELOW    = 30     # Producer refills when queue depth < this
+QUEUE_MAXSIZE         = 1000   # Large buffer so 5 consumers never starve
+QUEUE_REFILL_BELOW    = 200    # Producer refills when queue depth < this
 CANDIDATE_BATCH_SIZE  = 50     # wbgetentities max per API call
 EDIT_SUMMARY          = (
     "Added missing Bengali/Hindi labels, descriptions, and P18 image "
@@ -202,16 +214,17 @@ _state_lock = threading.Lock()
 
 # Mutable RAM state — no DB, no disk
 _bot_state: Dict[str, Any] = {
-    "is_active":              False,    # Controlled by POST /control
-    "completed_in_session":   0,        # Successful wbeditentity calls this session
-    "skipped_in_session":     0,        # Entities skipped (guardrail / no payload)
-    "errors_in_session":      0,        # Network / API errors
-    "current_qid":            None,     # QID being processed right now
-    "queue_depth":            0,        # Live snapshot of task_queue.qsize()
-    "edits_per_minute":       0.0,      # Rolling EPM telemetry
-    "last_edit_timestamp":    None,     # ISO timestamp of last successful edit
-    "status_message":         "Engine on Standby — awaiting start command",
-    "session_start_ts":       None,     # Set when first edit completes
+    "is_active":              AUTO_START,  # auto-True on laptop if .env has AUTO_START_BOT=true
+    "completed_in_session":   0,
+    "skipped_in_session":     0,
+    "errors_in_session":      0,
+    "current_qid":            None,
+    "queue_depth":            0,
+    "edits_per_minute":       0.0,
+    "last_edit_timestamp":    None,
+    "status_message":         "Auto-started (laptop mode)" if AUTO_START else "Engine on Standby — awaiting start command",
+    "session_start_ts":       None,
+    "mode":                   "LOCAL" if IS_LOCAL else "RENDER",
 }
 
 # In-memory edit history — capped at 500 entries (newest first)
@@ -777,14 +790,18 @@ def _startup() -> None:
         daemon=True,
     ).start()
 
-    # Consumer — daemon
-    threading.Thread(
-        target=_consumer_thread,
-        name="Consumer",
-        daemon=True,
-    ).start()
+    # Consumer threads — 5 on local, 1 on Render Free
+    num_consumers = 5 if IS_LOCAL else 1
+    for i in range(num_consumers):
+        threading.Thread(
+            target=_consumer_thread,
+            name=f"Consumer-{i}",
+            daemon=True,
+        ).start()
 
-    logger.info("WikiBot v3 threads started. Use POST /control {'action':'start'} to begin editing.")
+    mode_str = f"LOCAL ({num_consumers} consumers, ~{num_consumers*60} edits/min)" if IS_LOCAL else "RENDER (1 consumer, ~60 edits/min)"
+    start_str = "AUTO-STARTED (editing now!)" if AUTO_START else "PAUSED (start from dashboard)"
+    logger.info(f"WikiBot v3 ready | Mode: {mode_str} | Status: {start_str}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
