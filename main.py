@@ -73,13 +73,11 @@ else:
     logger.info("☁️  RENDER MODE — running as cloud service.")
 
 # ─── Tuning constants ─────────────────────────────────────────────────────────
-RATE_LIMIT_SEC        = 1.0    # Exact seconds between wbeditentity calls
+RATE_LIMIT_SEC        = 1.5    # 1.5s cadence = 40 edits/min (WMF safe threshold)
 QUEUE_MAXSIZE         = 1000   # Large buffer so 5 consumers never starve
 QUEUE_REFILL_BELOW    = 200    # Producer refills when queue depth < this
 CANDIDATE_BATCH_SIZE  = 50     # wbgetentities max per API call
-EDIT_SUMMARY          = (
-    "Added missing Bengali and Hindi labels, descriptions, and P18 image"
-)
+EDIT_SUMMARY          = "Added missing Bengali and Hindi labels and descriptions"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §3  UNICODE GUARDRAILS
@@ -465,8 +463,7 @@ def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
     Adds:
       • hi / bn labels  from verified Wikipedia sitelinks (hiwiki / bnwiki)
-      • hi / bn descs   from English description pattern matching
-      • P18 image       from Wikimedia Commons (verified keyword match)
+      • hi / bn descs   from English description pattern matching or Indian entity fallback
 
     Enforces strict Unicode guardrails — any label or description containing
     even one Latin character is silently discarded.
@@ -478,7 +475,6 @@ def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
     want_labels: Dict[str, Any] = {}
     want_descs:  Dict[str, Any] = {}
-    want_claims: List[Any]      = []
 
     # ── Labels from Wikipedia sitelinks ──────────────────────────────────────
     if "hi" not in labels and "hiwiki" in sitelinks:
@@ -491,7 +487,7 @@ def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if _script_ok(title, "bn"):
             want_labels["bn"] = {"language": "bn", "value": title}
 
-    # ── Descriptions from English pattern ────────────────────────────────────
+    # ── Descriptions ─────────────────────────────────────────────────────────
     en_desc = descriptions.get("en", {}).get("value", "")
     parsed  = _parse_en_desc(en_desc)
     if parsed:
@@ -509,27 +505,30 @@ def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 bn_desc = f"ভারতের {sm['bn']} রাজ্যের একটি {bn_type}"
                 if _script_ok(bn_desc, "bn"):
                     want_descs["bn"] = {"language": "bn", "value": bn_desc}
+    else:
+        # Fallback for Indian villages/settlements if state name is not in en_desc
+        is_india = False
+        for c in claims.get("P17", []):
+            if c.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id") == "Q668":
+                is_india = True
+                break
 
-    # ── P18 image from Wikimedia Commons ─────────────────────────────────────
-    if "P18" not in claims:
-        search_title = (
-            labels.get("en", {}).get("value")
-            or sitelinks.get("hiwiki", {}).get("title")
-        )
-        if search_title and len(search_title) > 3:
-            img = _search_commons_image(search_title)
-            if img:
-                want_claims.append({
-                    "mainsnak": {
-                        "snaktype":  "value",
-                        "property":  "P18",
-                        "datavalue": {"type": "string", "value": img},
-                    },
-                    "type": "statement",
-                    "rank": "normal",
-                })
+        desc_lo = en_desc.lower() if en_desc else ""
+        is_settlement = is_india or any(kw in desc_lo for kw in ["village", "settlement", "town", "city", "panchayat", "tehsil"])
 
-    if not want_labels and not want_descs and not want_claims:
+        if is_settlement:
+            etype = "village" if (not desc_lo or any(kw in desc_lo for kw in ["village", "settlement", "panchayat"])) else "city"
+            if "hi" not in descriptions:
+                hi_desc = "भारत का एक गाँव" if etype == "village" else "भारत का एक शहर"
+                if _script_ok(hi_desc, "hi"):
+                    want_descs["hi"] = {"language": "hi", "value": hi_desc}
+
+            if "bn" not in descriptions:
+                bn_desc = "ভারতের একটি গ্রাম" if etype == "village" else "ভারতের একটি শহর"
+                if _script_ok(bn_desc, "bn"):
+                    want_descs["bn"] = {"language": "bn", "value": bn_desc}
+
+    if not want_labels and not want_descs:
         return None
 
     payload: Dict[str, Any] = {}
@@ -537,8 +536,6 @@ def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]
         payload["labels"] = want_labels
     if want_descs:
         payload["descriptions"] = want_descs
-    if want_claims:
-        payload["claims"] = want_claims
     return payload
 
 
@@ -714,6 +711,15 @@ def _consumer_thread() -> None:
 
                 logger.info(f"SUCCESS [{qid}] latency={int((time.time()-t_start)*1000)}ms EPM={epm} Q={_task_queue.qsize()}")
 
+            # ── Check for Wikidata Anti-Abuse Throttle (actionthrottledtext) ────
+            res_str = json.dumps(res)
+            if "actionthrottledtext" in res_str or res.get("error", {}).get("code") in ("ratelimited", "actionthrottled"):
+                logger.warning(f"[{qid}] Wikidata Anti-Abuse Throttle active (actionthrottledtext). Cooling down for 180s...")
+                with _state_lock:
+                    _bot_state["status_message"] = "⚠️ Wikidata Throttled — Cooling down 3 minutes..."
+                _task_queue.put((qid, payload))  # re-queue item
+                time.sleep(180.0)
+
             # ── CSRF expired → refresh and retry once ─────────────────────────
             elif res.get("error", {}).get("code") == "badtoken":
                 logger.warning(f"[{qid}] badtoken — refreshing CSRF and retrying.")
@@ -730,12 +736,6 @@ def _consumer_thread() -> None:
                     logger.error(f"[{qid}] Edit failed after token refresh: {resp2.json()}")
                     with _state_lock:
                         _bot_state["errors_in_session"] += 1
-
-            # ── Rate-limited → back off, re-queue ────────────────────────────
-            elif res.get("error", {}).get("code") == "ratelimited":
-                logger.warning(f"[{qid}] ratelimited — backing off 10s, re-queuing.")
-                _task_queue.put((qid, payload))  # put back
-                time.sleep(10.0)
 
             # ── Any other API error ───────────────────────────────────────────
             else:
