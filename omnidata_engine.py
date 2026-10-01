@@ -249,6 +249,147 @@ class OmniDataEngine:
                 time.sleep(2)
             return False
 
+    DISALLOWED_IMAGE_KEYWORDS = [
+        'campus', 'school', 'hospital', 'orchard', 'station', 'police',
+        'college', 'temple', 'office', 'bank', 'stadium', 'hotel',
+        'restaurant', 'hall', 'building', 'court', 'gate', 'shop', 'farm',
+        'map of', 'location of', 'district'
+    ]
+
+    def search_commons_image(self, title: str) -> Optional[str]:
+        """Queries Wikimedia Commons for strictly verified localized media."""
+        if not title:
+            return None
+
+        clean_title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
+        if not clean_title or len(clean_title) < 3:
+            return None
+
+        commons_url = "https://commons.wikimedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": f'"{clean_title}" India',
+            "srnamespace": 6,  # File namespace
+            "srlimit": 5,
+            "format": "json"
+        }
+        try:
+            resp = self.session.get(commons_url, params=params, timeout=3)
+            resp.raise_for_status()
+            search_res = resp.json().get("query", {}).get("search", [])
+
+            for item in search_res:
+                raw_file_title = item.get("title", "")
+                if not raw_file_title.startswith("File:"):
+                    continue
+
+                file_name = raw_file_title[5:].strip()
+                file_lower = file_name.lower()
+                clean_lower = clean_title.lower()
+
+                # Rule 1: File name MUST explicitly contain clean title
+                if clean_lower not in file_lower:
+                    continue
+
+                # Rule 2: Reject misleading partial keywords unless title explicitly has them
+                has_disallowed = False
+                for kw in self.DISALLOWED_IMAGE_KEYWORDS:
+                    if kw in file_lower and kw not in clean_lower:
+                        has_disallowed = True
+                        break
+
+                if has_disallowed:
+                    logger.info(f"Skipping image '{file_name}' for '{clean_title}': contains unverified keyword.")
+                    continue
+
+                # Verified match found!
+                logger.info(f"VERIFIED Image match for '{clean_title}': {file_name}")
+                return file_name
+
+        except Exception as e:
+            logger.debug(f"Commons search error for {title}: {e}")
+
+        return None
+
+    def prepare_payload(self, qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Parses entity, extracts verified sitelink labels, generates descriptions, and formats payload."""
+        labels = entity.get("labels", {})
+        descriptions = entity.get("descriptions", {})
+        sitelinks = entity.get("sitelinks", {})
+        claims = entity.get("claims", {})
+
+        desire_labels = {}
+        desire_descriptions = {}
+        desire_claims = []
+
+        # 1. Native Labels strictly from verified sitelinks
+        if "hi" not in labels and "hiwiki" in sitelinks:
+            title = clean_sitelink_title(sitelinks["hiwiki"].get("title", ""))
+            if validate_script(title, "hi"):
+                desire_labels["hi"] = {"language": "hi", "value": title}
+
+        if "bn" not in labels and "bnwiki" in sitelinks:
+            title = clean_sitelink_title(sitelinks["bnwiki"].get("title", ""))
+            if validate_script(title, "bn"):
+                desire_labels["bn"] = {"language": "bn", "value": title}
+
+        # 2. Localized Descriptions from English patterns
+        en_desc = descriptions.get("en", {}).get("value", "")
+        parsed = parse_english_description(en_desc)
+        if parsed:
+            entity_type, state_key = parsed
+            state_mapping = INDIAN_STATES.get(state_key)
+            if state_mapping:
+                if "hi" not in descriptions:
+                    hi_state = state_mapping["hi"]
+                    hi_type_str = "गाँव" if entity_type == "village" else "शहर"
+                    hi_desc = f"भारत के {hi_state} राज्य का एक {hi_type_str}"
+                    if validate_script(hi_desc, "hi"):
+                        desire_descriptions["hi"] = {"language": "hi", "value": hi_desc}
+
+                if "bn" not in descriptions:
+                    bn_state = state_mapping["bn"]
+                    bn_type_str = "গ্রাম" if entity_type == "village" else "শহর"
+                    bn_desc = f"ভারতের {bn_state} রাজ্যের একটি {bn_type_str}"
+                    if validate_script(bn_desc, "bn"):
+                        desire_descriptions["bn"] = {"language": "bn", "value": bn_desc}
+
+        # 3. P18 Image from Wikimedia Commons (Fast Verified Sitelink Title Match)
+        if "P18" not in claims:
+            search_title = None
+            if "en" in labels:
+                search_title = labels["en"].get("value")
+            elif "hiwiki" in sitelinks:
+                search_title = sitelinks["hiwiki"].get("title")
+
+            # Fast non-blocking Commons image check
+            if search_title and len(search_title) > 3:
+                commons_img = self.search_commons_image(search_title)
+                if commons_img:
+                    desire_claims.append({
+                        "mainsnak": {
+                            "snaktype": "value",
+                            "property": "P18",
+                            "datavalue": {"type": "string", "value": commons_img}
+                        },
+                        "type": "statement",
+                        "rank": "normal"
+                    })
+
+        if not desire_labels and not desire_descriptions and not desire_claims:
+            return None
+
+        payload_data = {}
+        if desire_labels:
+            payload_data["labels"] = desire_labels
+        if desire_descriptions:
+            payload_data["descriptions"] = desire_descriptions
+        if desire_claims:
+            payload_data["claims"] = desire_claims
+
+        return payload_data
+
     SEARCH_QUERIES = [
         "haswbstatement:P31=Q532 haswbstatement:P17=Q668",      # Villages in India
         "haswbstatement:P31=Q486914 haswbstatement:P17=Q668",   # Settlements in India
@@ -258,11 +399,11 @@ class OmniDataEngine:
     ]
 
     def fetch_candidates_batch(self, offset: int = 0) -> List[str]:
-        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch query rotation with random jumps."""
+        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch query rotation with safe random offsets."""
         import random
         qids = []
         query = random.choice(self.SEARCH_QUERIES)
-        sroffset = random.randint(0, 40000)
+        sroffset = random.randint(0, 18) * 500  # Safe offset between 0 and 9000
         
         try:
             search_params = {
@@ -285,6 +426,26 @@ class OmniDataEngine:
             logger.error(f"CirrusSearch fetch error: {e}")
 
         return qids
+
+    def fetch_entities_batch(self, qids: List[str]) -> Dict[str, Any]:
+        """Fetches batch of up to 50 entities via MediaWiki Action API."""
+        if not qids:
+            return {}
+        chunk = qids[:50]
+        params = {
+            "action": "wbgetentities",
+            "ids": "|".join(chunk),
+            "props": "labels|descriptions|claims|sitelinks",
+            "languages": "en|hi|bn",
+            "format": "json"
+        }
+        try:
+            resp = self.session.get(self.config.api_url, params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json().get("entities", {})
+        except Exception as e:
+            logger.error(f"Failed to fetch entities batch: {e}")
+            return {}
 
     def fetch_sparql_batch(self, limit: int = 500) -> List[str]:
         """Backward compatibility wrapper around fetch_candidates_batch."""
