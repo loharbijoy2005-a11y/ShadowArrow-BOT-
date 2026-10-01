@@ -19,11 +19,16 @@ export default function DashboardHome() {
     anomalyRate: 0.0,
     botStatus: 'PAUSED',
     sitelinkHitRate: 98.2,
-    requestDelay: 0.8,
+    requestDelay: 1.0,
     verifiedCount: 0,
     flaggedCount: 0,
     currentQid: null as string | null,
-    statusMessage: 'Engine on Standby'
+    statusMessage: 'Engine on Standby',
+    editsPerMinute: 0,
+    queueDepth: 0,
+    mode: 'RENDER',
+    errorsInSession: 0,
+    skippedInSession: 0,
   });
 
   const [edits, setEdits] = useState<EditRecord[]>([]);

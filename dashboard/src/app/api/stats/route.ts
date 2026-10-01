@@ -17,22 +17,32 @@ export async function GET() {
     }
 
     const data = await res.json();
-    const isActive = data.is_active === true;
+    const isActive       = data.is_active === true;
     const completedCount = data.completed_in_session || 0;
+    const epm            = data.edits_per_minute || 0;
+    const queueDepth     = data.queue_depth || 0;
+    const mode           = data.mode || (data.is_active !== undefined ? 'RENDER' : 'UNKNOWN');
+    const errors         = data.errors_in_session || 0;
+    const skipped        = data.skipped_in_session || 0;
 
     return NextResponse.json({
       success: true,
       stats: {
-        totalEditsToday: completedCount,
+        totalEditsToday:    completedCount,
         totalEditsLifetime: completedCount,
-        anomalyRate: 0.0,
-        botStatus: isActive ? 'RUNNING' : 'PAUSED',
-        sitelinkHitRate: 98.2,
-        requestDelay: 0.8,
-        verifiedCount: completedCount,
-        flaggedCount: 0,
-        currentQid: data.current_qid,
-        statusMessage: data.status_message
+        anomalyRate:        0.0,
+        botStatus:          isActive ? 'RUNNING' : 'PAUSED',
+        sitelinkHitRate:    98.2,
+        requestDelay:       data.requestDelay || 1.0,
+        verifiedCount:      completedCount,
+        flaggedCount:       0,
+        currentQid:         data.current_qid    || null,
+        statusMessage:      data.status_message || 'Standby',
+        editsPerMinute:     epm,
+        queueDepth:         queueDepth,
+        mode:               mode,
+        errorsInSession:    errors,
+        skippedInSession:   skipped,
       }
     });
   } catch (error: any) {
