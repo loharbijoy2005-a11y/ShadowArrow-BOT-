@@ -94,25 +94,15 @@ def background_wikidata_worker():
 
     logger.info("Render background worker successfully authenticated with Wikidata.")
 
-    # Background candidate pre-fetcher thread
-    def fetcher_loop():
-        while True:
-            if engine_state["is_active"] and not engine.producer_finished:
-                engine.producer_loop()
-            time.sleep(2.0)
-
-    fetcher_thread = threading.Thread(target=fetcher_loop, name="RenderProducer", daemon=True)
-    fetcher_thread.start()
+    # Background candidate pre-fetcher thread (Infinite Producer)
+    producer_thread = threading.Thread(target=engine.producer_loop, name="RenderProducer", daemon=True)
+    producer_thread.start()
 
     # Main writer loop
     while True:
         if engine_state["is_active"]:
             t_start = time.time()
             try:
-                # If producer finished and queue is empty, refresh candidates
-                if engine.task_queue.empty() and engine.producer_finished:
-                    engine.producer_finished = False
-
                 qid, payload_data = engine.task_queue.get(timeout=2.0)
 
                 # Script Guardrails Check

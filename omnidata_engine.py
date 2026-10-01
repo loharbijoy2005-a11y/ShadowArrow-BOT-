@@ -249,259 +249,115 @@ class OmniDataEngine:
                 time.sleep(2)
             return False
 
-    def fetch_sparql_batch(self, limit: int = 500) -> List[str]:
-        """Queries Wikidata SPARQL endpoint for Indian human settlements needing enrichment."""
-        sparql_url = "https://query.wikidata.org/sparql"
-        query = f"""
-        SELECT DISTINCT ?item WHERE {{
-          ?item wdt:P31/wdt:279* wd:Q486914 ;
-                wdt:P17 wd:Q668 .
-          OPTIONAL {{ ?item rdfs:label ?hiLabel FILTER(LANG(?hiLabel) = "hi") }}
-          OPTIONAL {{ ?item rdfs:label ?bnLabel FILTER(LANG(?bnLabel) = "bn") }}
-          OPTIONAL {{ ?item wdt:P18 ?image }}
-          FILTER(!BOUND(?hiLabel) || !BOUND(?bnLabel) || !BOUND(?image))
-        }} LIMIT {limit}
-        """
-        headers = {
-            "User-Agent": self.config.user_agent,
-            "Accept": "application/sparql-results+json"
-        }
+    def fetch_candidates_batch(self, offset: int = 0) -> List[str]:
+        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch & SPARQL pagination."""
+        qids = []
+        
+        # 1. MediaWiki CirrusSearch for Indian entities (P17=Q668) with pagination
         try:
-            resp = requests.get(sparql_url, params={"query": query, "format": "json"}, headers=headers, timeout=20)
-            resp.raise_for_status()
-            results = resp.json().get("results", {}).get("bindings", [])
-            qids = []
-            for item in results:
-                uri = item.get("item", {}).get("value", "")
-                if "/Q" in uri:
-                    qid = uri.split("/")[-1]
-                    if qid not in self.completed_qids:
-                        qids.append(qid)
-            logger.info(f"SPARQL returned {len(qids)} pending QIDs.")
-            if qids:
-                return qids
-            
-            # Fallback to CirrusSearch for continuous candidate retrieval
-            logger.info("SPARQL returned 0 new QIDs. Triggering CirrusSearch fallback...")
             search_params = {
                 "action": "query",
                 "list": "search",
-                "srsearch": "village in India",
+                "srsearch": "haswbstatement:P17=Q668",
                 "srlimit": 500,
+                "sroffset": offset % 10000,
                 "format": "json"
             }
             s_resp = self.session.get(self.config.api_url, params=search_params, timeout=15)
-            s_res = s_resp.json().get("query", {}).get("search", [])
-            for item in s_res:
-                title = item.get("title", "")
-                if title.startswith("Q") and title[1:].isdigit() and title not in self.completed_qids:
-                    qids.append(title)
-            logger.info(f"CirrusSearch fallback discovered {len(qids)} fresh QIDs.")
-            return qids
+            if s_resp.status_code == 200:
+                s_res = s_resp.json().get("query", {}).get("search", [])
+                for item in s_res:
+                    title = item.get("title", "")
+                    if title.startswith("Q") and title[1:].isdigit() and title not in self.completed_qids:
+                        qids.append(title)
+            logger.info(f"CirrusSearch returned {len(qids)} pending QIDs (sroffset={offset}).")
         except Exception as e:
-            logger.error(f"Target query fetch failed: {e}")
-            return []
+            logger.error(f"CirrusSearch fetch error: {e}")
 
-    def fetch_entities_batch(self, qids: List[str]) -> Dict[str, Any]:
-        """Fetches batch of up to 50 entities via MediaWiki Action API."""
-        if not qids:
-            return {}
-        chunk = qids[:50]
-        params = {
-            "action": "wbgetentities",
-            "ids": "|".join(chunk),
-            "props": "labels|descriptions|claims|sitelinks",
-            "languages": "en|hi|bn",
-            "format": "json"
-        }
-        try:
-            resp = self.session.get(self.config.api_url, params=params, timeout=15)
-            resp.raise_for_status()
-            return resp.json().get("entities", {})
-        except Exception as e:
-            logger.error(f"Failed to fetch entities batch: {e}")
-            return {}
+        # 2. If CirrusSearch yielded few items, query SPARQL as fallback
+        if len(qids) < 50:
+            sparql_url = "https://query.wikidata.org/sparql"
+            query = f"""
+            SELECT DISTINCT ?item WHERE {{
+              ?item wdt:P17 wd:Q668 .
+            }} LIMIT 500 OFFSET {offset % 5000}
+            """
+            headers = {
+                "User-Agent": self.config.user_agent,
+                "Accept": "application/sparql-results+json"
+            }
+            try:
+                resp = requests.get(sparql_url, params={"query": query, "format": "json"}, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    results = resp.json().get("results", {}).get("bindings", [])
+                    for item in results:
+                        uri = item.get("item", {}).get("value", "")
+                        if "/Q" in uri:
+                            qid = uri.split("/")[-1]
+                            if qid not in self.completed_qids:
+                                qids.append(qid)
+                logger.info(f"SPARQL fallback returned {len(qids)} pending QIDs.")
+            except Exception as e:
+                logger.debug(f"SPARQL fetch notice: {e}")
 
-    DISALLOWED_IMAGE_KEYWORDS = [
-        'campus', 'school', 'hospital', 'orchard', 'station', 'police',
-        'college', 'temple', 'office', 'bank', 'stadium', 'hotel',
-        'restaurant', 'hall', 'building', 'court', 'gate', 'shop', 'farm',
-        'map of', 'location of', 'district'
-    ]
+        return qids
 
-    def search_commons_image(self, title: str) -> Optional[str]:
-        """
-        Queries Wikimedia Commons for strictly verified localized media.
-        Enforces strict guardrails:
-        1. Query uses exact quoted search phrase.
-        2. File title MUST contain the entity title.
-        3. File title MUST NOT contain misleading partial keywords (campus, orchard, station, etc.).
-        """
-        if not title:
-            return None
-
-        clean_title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
-        if not clean_title or len(clean_title) < 3:
-            return None
-
-        commons_url = "https://commons.wikimedia.org/w/api.php"
-        params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": f'"{clean_title}" India',
-            "srnamespace": 6,  # File namespace
-            "srlimit": 5,
-            "format": "json"
-        }
-        try:
-            resp = self.session.get(commons_url, params=params, timeout=3)
-            resp.raise_for_status()
-            search_res = resp.json().get("query", {}).get("search", [])
-
-            for item in search_res:
-                raw_file_title = item.get("title", "")
-                if not raw_file_title.startswith("File:"):
-                    continue
-
-                file_name = raw_file_title[5:].strip()
-                file_lower = file_name.lower()
-                clean_lower = clean_title.lower()
-
-                # Rule 1: File name MUST explicitly contain clean title
-                if clean_lower not in file_lower:
-                    continue
-
-                # Rule 2: Reject misleading partial keywords unless title explicitly has them
-                has_disallowed = False
-                for kw in self.DISALLOWED_IMAGE_KEYWORDS:
-                    if kw in file_lower and kw not in clean_lower:
-                        has_disallowed = True
-                        break
-
-                if has_disallowed:
-                    logger.info(f"Skipping image '{file_name}' for '{clean_title}': contains unverified keyword.")
-                    continue
-
-                # Verified match found!
-                logger.info(f"VERIFIED Image match for '{clean_title}': {file_name}")
-                return file_name
-
-        except Exception as e:
-            logger.debug(f"Commons search error for {title}: {e}")
-
-        return None
-
-    def prepare_payload(self, qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Parses entity, extracts verified sitelink labels, generates descriptions, and formats payload."""
-        labels = entity.get("labels", {})
-        descriptions = entity.get("descriptions", {})
-        sitelinks = entity.get("sitelinks", {})
-        claims = entity.get("claims", {})
-
-        desire_labels = {}
-        desire_descriptions = {}
-        desire_claims = []
-
-        # 1. Native Labels strictly from verified sitelinks
-        if "hi" not in labels and "hiwiki" in sitelinks:
-            title = clean_sitelink_title(sitelinks["hiwiki"].get("title", ""))
-            if validate_script(title, "hi"):
-                desire_labels["hi"] = {"language": "hi", "value": title}
-
-        if "bn" not in labels and "bnwiki" in sitelinks:
-            title = clean_sitelink_title(sitelinks["bnwiki"].get("title", ""))
-            if validate_script(title, "bn"):
-                desire_labels["bn"] = {"language": "bn", "value": title}
-
-        # 2. Localized Descriptions from English patterns
-        en_desc = descriptions.get("en", {}).get("value", "")
-        parsed = parse_english_description(en_desc)
-        if parsed:
-            entity_type, state_key = parsed
-            state_mapping = INDIAN_STATES.get(state_key)
-            if state_mapping:
-                if "hi" not in descriptions:
-                    hi_state = state_mapping["hi"]
-                    hi_type_str = "शहर/गाँव" if entity_type == "village" else "शहर"
-                    hi_desc = f"भारत के {hi_state} राज्य का एक {hi_type_str}"
-                    if validate_script(hi_desc, "hi"):
-                        desire_descriptions["hi"] = {"language": "hi", "value": hi_desc}
-
-                if "bn" not in descriptions:
-                    bn_state = state_mapping["bn"]
-                    bn_type_str = "শহর/গ্রাম" if entity_type == "village" else "শহর"
-                    bn_desc = f"ভারতের {bn_state} রাজ্যের একটি {bn_type_str}"
-                    if validate_script(bn_desc, "bn"):
-                        desire_descriptions["bn"] = {"language": "bn", "value": bn_desc}
-
-        # 3. P18 Image from Wikimedia Commons (Fast Verified Sitelink Title Match)
-        if "P18" not in claims:
-            search_title = None
-            if "en" in labels:
-                search_title = labels["en"].get("value")
-            elif "hiwiki" in sitelinks:
-                search_title = sitelinks["hiwiki"].get("title")
-
-            # Fast non-blocking Commons image check
-            if search_title and len(search_title) > 3:
-                commons_img = self.search_commons_image(search_title)
-                if commons_img:
-                    desire_claims.append({
-                        "mainsnak": {
-                            "snaktype": "value",
-                            "property": "P18",
-                            "datavalue": {"type": "string", "value": commons_img}
-                        },
-                        "type": "statement",
-                        "rank": "normal"
-                    })
-
-        if not desire_labels and not desire_descriptions and not desire_claims:
-            return None
-
-        payload_data = {}
-        if desire_labels:
-            payload_data["labels"] = desire_labels
-        if desire_descriptions:
-            payload_data["descriptions"] = desire_descriptions
-        if desire_claims:
-            payload_data["claims"] = desire_claims
-
-        return payload_data
+    def fetch_sparql_batch(self, limit: int = 500) -> List[str]:
+        """Backward compatibility wrapper around fetch_candidates_batch."""
+        return self.fetch_candidates_batch(offset=0)
 
     def producer_loop(self):
-        """Thread A: Worker that batch-fetches entities and prepares payload with ThreadPoolExecutor."""
+        """Thread A: Infinite worker that continuously pre-fetches and queues valid edit payloads."""
         from concurrent.futures import ThreadPoolExecutor
-        logger.info("Producer thread started.")
-        qids = self.fetch_sparql_batch(limit=500)
-        batch_size = 50
+        logger.info("Producer infinite worker thread started.")
+        offset = 0
 
         with ThreadPoolExecutor(max_workers=10) as executor:
-            for i in range(0, len(qids), batch_size):
-                chunk = qids[i:i + batch_size]
-                entities = self.fetch_entities_batch(chunk)
+            while True:
+                # Keep queue buffered up to 200 items
+                if self.task_queue.qsize() > 150:
+                    time.sleep(2.0)
+                    continue
 
-                # Parallelize candidate payload preparation
-                futures = []
-                for qid in chunk:
-                    entity = entities.get(qid, {})
-                    if not entity:
-                        futures.append((qid, None))
-                        continue
-                    futures.append((qid, executor.submit(self.prepare_payload, qid, entity)))
+                qids = self.fetch_candidates_batch(offset=offset)
+                offset += 500
+                if offset >= 20000:
+                    offset = 0  # Wrap around
 
-                for qid, fut in futures:
-                    if fut is None:
-                        continue
-                    try:
-                        payload_data = fut.result()
-                        if payload_data:
-                            self.task_queue.put((qid, payload_data))
-                    except Exception as e:
-                        logger.error(f"Error preparing payload for {qid}: {e}")
+                if not qids:
+                    logger.info("No candidates returned in chunk. Sleeping 5 seconds before retrying...")
+                    time.sleep(5.0)
+                    continue
 
-        self.producer_finished = True
-        logger.info("Producer thread finished fetching and queueing payloads.")
+                batch_size = 50
+                added_count = 0
+
+                for i in range(0, len(qids), batch_size):
+                    chunk = qids[i:i + batch_size]
+                    entities = self.fetch_entities_batch(chunk)
+
+                    futures = []
+                    for qid in chunk:
+                        entity = entities.get(qid, {})
+                        if not entity:
+                            futures.append((qid, None))
+                            continue
+                        futures.append((qid, executor.submit(self.prepare_payload, qid, entity)))
+
+                    for qid, fut in futures:
+                        if fut is None:
+                            continue
+                        try:
+                            payload_data = fut.result()
+                            if payload_data:
+                                self.task_queue.put((qid, payload_data))
+                                added_count += 1
+                        except Exception as e:
+                            logger.error(f"Error preparing payload for {qid}: {e}")
+
+                logger.info(f"Producer chunk complete: Queued {added_count} valid payloads. Total Queue Size: {self.task_queue.qsize()}")
+
+        logger.info("Producer thread exiting.")
 
     def consumer_loop(self):
         """Thread B: Writer that executes wbeditentity at maximum safe 0.8s cycle speed."""
