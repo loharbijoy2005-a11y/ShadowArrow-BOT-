@@ -147,7 +147,6 @@ def background_wikidata_worker():
                 "data": json.dumps(payload_data, ensure_ascii=False),
                 "token": engine.csrf_token,
                 "summary": "Added missing Bengali and Hindi labels, descriptions, and P18 media statements",
-                "bot": 1,
                 "format": "json"
             }
 

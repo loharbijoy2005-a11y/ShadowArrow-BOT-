@@ -78,8 +78,7 @@ QUEUE_MAXSIZE         = 1000   # Large buffer so 5 consumers never starve
 QUEUE_REFILL_BELOW    = 200    # Producer refills when queue depth < this
 CANDIDATE_BATCH_SIZE  = 50     # wbgetentities max per API call
 EDIT_SUMMARY          = (
-    "Added missing Bengali/Hindi labels, descriptions, and P18 image "
-    "via ShadowArrow Bot v3"
+    "Added missing Bengali and Hindi labels, descriptions, and P18 image"
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -672,7 +671,6 @@ def _consumer_thread() -> None:
             "data":    json.dumps(payload, ensure_ascii=False),
             "token":   _csrf_token,
             "summary": EDIT_SUMMARY,
-            "bot":     1,
             "format":  "json",
         }
 

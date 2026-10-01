@@ -597,7 +597,6 @@ class OmniDataEngine:
                 "data": json.dumps(payload_data, ensure_ascii=False),
                 "token": self.csrf_token,
                 "summary": "Added missing Bengali and Hindi labels, descriptions, and P18 media statements",
-                "bot": 1,
                 "format": "json"
             }
 
