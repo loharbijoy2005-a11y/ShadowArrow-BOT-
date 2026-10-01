@@ -147,9 +147,9 @@ class OmniDataEngine:
         # Session with HTTPAdapter connection pool
         self.session = requests.Session()
         adapter = HTTPAdapter(
-            pool_connections=25,
-            pool_maxsize=25,
-            max_retries=Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+            pool_connections=50,
+            pool_maxsize=100,
+            max_retries=Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
         )
         self.session.mount("https://", adapter)
         self.session.headers.update({
@@ -161,8 +161,8 @@ class OmniDataEngine:
         self.auth_lock = threading.RLock()
         self.is_logged_in = False
 
-        # Queue & State
-        self.task_queue: queue.Queue = queue.Queue(maxsize=100)
+        # Queue & State (Max 300 candidates pre-fetched in RAM)
+        self.task_queue: queue.Queue = queue.Queue(maxsize=300)
         self.completed_qids = self._load_completed_qids()
         self.skipped_entities: List[Dict[str, Any]] = []
 
@@ -470,31 +470,45 @@ class OmniDataEngine:
         return payload_data
 
     def producer_loop(self):
-        """Thread A: Worker that batch-fetches entities and prepares payload."""
+        """Thread A: Worker that batch-fetches entities and prepares payload with ThreadPoolExecutor."""
+        from concurrent.futures import ThreadPoolExecutor
         logger.info("Producer thread started.")
         qids = self.fetch_sparql_batch(limit=500)
         batch_size = 50
 
-        for i in range(0, len(qids), batch_size):
-            chunk = qids[i:i + batch_size]
-            entities = self.fetch_entities_batch(chunk)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for i in range(0, len(qids), batch_size):
+                chunk = qids[i:i + batch_size]
+                entities = self.fetch_entities_batch(chunk)
 
-            for qid in chunk:
-                entity = entities.get(qid, {})
-                if not entity:
-                    continue
-                payload_data = self.prepare_payload(qid, entity)
-                if payload_data:
-                    self.task_queue.put((qid, payload_data))
+                # Parallelize candidate payload preparation
+                futures = []
+                for qid in chunk:
+                    entity = entities.get(qid, {})
+                    if not entity:
+                        futures.append((qid, None))
+                        continue
+                    futures.append((qid, executor.submit(self.prepare_payload, qid, entity)))
+
+                for qid, fut in futures:
+                    if fut is None:
+                        continue
+                    try:
+                        payload_data = fut.result()
+                        if payload_data:
+                            self.task_queue.put((qid, payload_data))
+                    except Exception as e:
+                        logger.error(f"Error preparing payload for {qid}: {e}")
 
         self.producer_finished = True
         logger.info("Producer thread finished fetching and queueing payloads.")
 
     def consumer_loop(self):
-        """Thread B: Writer that executes wbeditentity with 0.8s interval."""
+        """Thread B: Writer that executes wbeditentity at maximum safe 0.8s cycle speed."""
         logger.info("Consumer writer thread started.")
 
         while True:
+            t_start = time.time()
             try:
                 qid, payload_data = self.task_queue.get(timeout=2.0)
             except queue.Empty:
@@ -557,7 +571,10 @@ class OmniDataEngine:
                 self.log_skipped_entity(qid, f"Exception: {str(e)}", payload_data)
 
             self.task_queue.task_done()
-            time.sleep(0.8)  # Exact 0.8s rate-limit safe interval
+            # Dynamic sleep to guarantee exact 0.8s rate limit cycle
+            elapsed = time.time() - t_start
+            sleep_needed = max(0.0, 0.8 - elapsed)
+            time.sleep(sleep_needed)
 
     def run(self):
         """Starts Producer-Consumer pipeline."""

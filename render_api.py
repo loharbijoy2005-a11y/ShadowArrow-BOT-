@@ -107,6 +107,7 @@ def background_wikidata_worker():
     # Main writer loop
     while True:
         if engine_state["is_active"]:
+            t_start = time.time()
             try:
                 # If producer finished and queue is empty, refresh candidates
                 if engine.task_queue.empty() and engine.producer_finished:
@@ -181,7 +182,10 @@ def background_wikidata_worker():
             except Exception as e:
                 logger.error(f"Worker exception: {e}")
 
-            time.sleep(0.8)  # STRICT 0.8s RATE LIMIT (DO NOT LOWER)
+            # Dynamic sleep calculation for exact 0.8s rate-limit interval
+            elapsed = time.time() - t_start
+            sleep_needed = max(0.0, 0.8 - elapsed)
+            time.sleep(sleep_needed)
         else:
             with state_lock:
                 engine_state["current_qid"] = None

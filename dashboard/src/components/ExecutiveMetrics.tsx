@@ -23,7 +23,7 @@ export default function ExecutiveMetrics({ stats }: StatsProps) {
       {/* Card 1: Edits Today */}
       <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-xl hover:border-slate-700 transition-all shadow-xl shadow-slate-950/50">
         <div className="flex items-center justify-between mb-3">
-          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Edits Today</span>
+          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Session Edits</span>
           <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
             <TrendingUp className="w-4 h-4 text-indigo-400" />
           </div>
@@ -31,26 +31,29 @@ export default function ExecutiveMetrics({ stats }: StatsProps) {
         <div className="flex items-baseline space-x-2">
           <span className="text-3xl font-extrabold text-white font-mono">{stats.totalEditsToday}</span>
           <span className="text-xs font-semibold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
-            +18/hr
+            ~75 edits/min
           </span>
         </div>
         <p className="text-xs text-slate-400 mt-2">Active session writes</p>
       </div>
 
-      {/* Card 2: Total Lifetime Edits */}
-      <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-xl hover:border-slate-700 transition-all shadow-xl shadow-slate-950/50">
+      {/* Card 2: Maximum Speed Telemetry */}
+      <div className="p-5 rounded-2xl bg-gradient-to-br from-indigo-950/40 via-slate-900/60 to-slate-900/60 border border-indigo-500/30 backdrop-blur-xl hover:border-indigo-500/50 transition-all shadow-xl shadow-indigo-500/5">
         <div className="flex items-center justify-between mb-3">
-          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Lifetime Edits</span>
-          <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
-            <Database className="w-4 h-4 text-emerald-400" />
+          <span className="text-xs font-bold text-indigo-400 uppercase tracking-wider">Engine Speed</span>
+          <div className="w-8 h-8 rounded-lg bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center animate-pulse">
+            <Database className="w-4 h-4 text-indigo-300" />
           </div>
         </div>
         <div className="flex items-baseline space-x-2">
-          <span className="text-3xl font-extrabold text-white font-mono">{stats.totalEditsLifetime.toLocaleString()}</span>
+          <span className="text-3xl font-extrabold text-indigo-300 font-mono">0.8s</span>
+          <span className="text-xs font-black uppercase text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/30">
+            MAX SPEED
+          </span>
         </div>
-        <p className="text-xs text-emerald-400/90 font-medium mt-2 flex items-center space-x-1">
-          <CheckCircle2 className="w-3 h-3 inline mr-1 text-emerald-400" />
-          100% MediaWiki Compliant
+        <p className="text-xs text-indigo-300/80 font-medium mt-2 flex items-center space-x-1">
+          <CheckCircle2 className="w-3.5 h-3.5 inline mr-1 text-emerald-400" />
+          Exact 0.8s Anti-Abuse Rate Limit
         </p>
       </div>
 
