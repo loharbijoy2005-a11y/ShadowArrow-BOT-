@@ -79,7 +79,7 @@ QUEUE_REFILL_BELOW    = 200    # Producer refills when queue depth < this
 CANDIDATE_BATCH_SIZE  = 50     # wbgetentities max per API call
 EDIT_SUMMARY          = (
     "Added missing Bengali/Hindi labels, descriptions, and P18 image "
-    "via ShadowArrow Bot v3 | [[Wikidata:Bots|Bot policy compliant]]"
+    "via ShadowArrow Bot v3"
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
