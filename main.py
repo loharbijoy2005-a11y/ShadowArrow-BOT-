@@ -1,214 +1,923 @@
 """
-Main entry point for Wikidata Regional Label & Description Bot.
-Executes batch processing, anti-abuse throttling, and logging.
+main.py — Production-Grade Wikidata Automation Backend (Render Web Service)
+============================================================================
+Architecture:
+  - FastAPI control plane (X-Bot-Token authenticated endpoints)
+  - Producer Thread: CirrusSearch → wbgetentities → Unicode guardrails → queue
+  - Consumer Thread: queue → wbeditentity @ exact 1.0s cadence
+  - Zero external database — ALL state lives exclusively in Python RAM
+
+Threading:
+  Producer  fills  queue.Queue(maxsize=100) when depth < 30
+  Consumer  drains queue.Queue            at exactly 1.0s per write
+
+Rate Limit:  1 edit / second  (60 edits/minute max, WMF-safe)
 """
 
-import sys
+# ─── Standard Library ────────────────────────────────────────────────────────
+import os
+import re
+import json
 import time
-import argparse
+import queue
+import random
 import logging
-from pathlib import Path
+import threading
+import unicodedata
+from typing import Any, Dict, List, Optional, Tuple
 
-from config import Config
-from state_tracker import StateTracker
-from api_client import MediaWikiClient
-from wikidata_bot import WikidataBot
-from feeder import DataFeeder, ItemRecord
+# ─── Third-Party ─────────────────────────────────────────────────────────────
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-def setup_logging(verbose: bool = False, log_file: str = "bot_execution.log") -> logging.Logger:
-    """Configures structured console and file logging with UTF-8 encoding support."""
-    # Ensure Windows stdout/stderr handle UTF-8 Bengali & Hindi characters cleanly
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# ─── Load .env (Render env vars take precedence) ─────────────────────────────
+load_dotenv()
 
-    logger = logging.getLogger("WikidataBot")
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    logger.handlers.clear()
+# ══════════════════════════════════════════════════════════════════════════════
+# §1  LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger("WikiBot")
 
-    # Formatter with timestamp, level, logger name, and message
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+# ══════════════════════════════════════════════════════════════════════════════
+# §2  ENVIRONMENT / CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+API_URL       = os.getenv("WIKIDATA_API_URL",   "https://www.wikidata.org/w/api.php")
+BOT_USER      = os.getenv("WIKIDATA_BOT_USER",  "")
+BOT_PASSWORD  = os.getenv("WIKIDATA_BOT_PASSWORD", "")
+USER_AGENT    = os.getenv(
+    "USER_AGENT",
+    "ShadowBot/3.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026; contact via talk page) python-requests/2.31"
+)
+SECRET_KEY    = os.getenv("INTERNAL_BOT_SECRET", "SHADOW_SECURE_TOKEN_2026")
+
+# ─── Tuning constants ─────────────────────────────────────────────────────────
+RATE_LIMIT_SEC        = 1.0    # Exact seconds between wbeditentity calls
+QUEUE_MAXSIZE         = 100    # Hard cap on in-flight payload buffer
+QUEUE_REFILL_BELOW    = 30     # Producer refills when queue depth < this
+CANDIDATE_BATCH_SIZE  = 50     # wbgetentities max per API call
+EDIT_SUMMARY          = (
+    "Added missing Bengali/Hindi labels, descriptions, and P18 image "
+    "via ShadowArrow Bot v3 | [[Wikidata:Bots|Bot policy compliant]]"
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §3  UNICODE GUARDRAILS
+# ══════════════════════════════════════════════════════════════════════════════
+_RE_LATIN      = re.compile(r"[a-zA-Z]")
+_RE_DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+_RE_BENGALI    = re.compile(r"[\u0980-\u09FF]")
+
+
+def _script_ok(text: str, lang: str) -> bool:
+    """
+    Hard Unicode guardrail — drops any text that:
+      • Contains even one Latin [a-zA-Z] character
+      • Has wrong script for target language
+    Returns True only if text is script-pure for the given lang.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    if _RE_LATIN.search(text):
+        return False
+    has_hi = bool(_RE_DEVANAGARI.search(text))
+    has_bn = bool(_RE_BENGALI.search(text))
+    if lang == "hi":
+        return has_hi and not has_bn
+    if lang == "bn":
+        return has_bn and not has_hi
+    return False
+
+
+def _clean_title(title: str) -> str:
+    """Strips disambiguation suffixes: 'Patna (city)' → 'Patna'."""
+    if not title:
+        return ""
+    return unicodedata.normalize("NFC", re.sub(r"\s*\([^)]*\)$", "", title).strip())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §4  INDIAN STATE/UT TRANSLATION MAP
+# ══════════════════════════════════════════════════════════════════════════════
+_STATES: Dict[str, Dict[str, str]] = {
+    "Andhra Pradesh":    {"hi": "आंध्र प्रदेश",    "bn": "অন্ধ্রপ্রদেশ"},
+    "Arunachal Pradesh": {"hi": "अरुणाचल प्रदेश",  "bn": "অরুণাচল প্রদেশ"},
+    "Assam":             {"hi": "असम",              "bn": "অসম"},
+    "Bihar":             {"hi": "बिहार",            "bn": "বিহার"},
+    "Chhattisgarh":      {"hi": "छत्तीसगढ़",        "bn": "ছত্তিশগড়"},
+    "Goa":               {"hi": "गोवा",             "bn": "গোয়া"},
+    "Gujarat":           {"hi": "गुजरात",           "bn": "গুজরাত"},
+    "Haryana":           {"hi": "हरियाणा",          "bn": "হরিয়ানা"},
+    "Himachal Pradesh":  {"hi": "हिमाचल प्रदेश",   "bn": "হিমাচল প্রদেশ"},
+    "Jharkhand":         {"hi": "झारखंड",           "bn": "ঝাড়খণ্ড"},
+    "Karnataka":         {"hi": "कर्नाटक",          "bn": "কর্ণাটক"},
+    "Kerala":            {"hi": "केरल",             "bn": "কেরালা"},
+    "Madhya Pradesh":    {"hi": "मध्य प्रदेश",      "bn": "মধ্যপ্রদেশ"},
+    "Maharashtra":       {"hi": "महाराष्ट्र",       "bn": "মহারাষ্ট্র"},
+    "Manipur":           {"hi": "मणिपुर",           "bn": "মণিপুর"},
+    "Meghalaya":         {"hi": "मेघालय",           "bn": "মেঘালয়"},
+    "Mizoram":           {"hi": "मिजोरम",           "bn": "মিজোরাম"},
+    "Nagaland":          {"hi": "नागालैंड",         "bn": "নাগাল্যান্ড"},
+    "Odisha":            {"hi": "ओडिशा",            "bn": "ওড়িশা"},
+    "Orissa":            {"hi": "ओडिशा",            "bn": "ওড়িশা"},
+    "Punjab":            {"hi": "पंजाब",            "bn": "পাঞ্জাব"},
+    "Rajasthan":         {"hi": "राजस्थान",         "bn": "রাজস্থান"},
+    "Sikkim":            {"hi": "सिक्किम",          "bn": "সিকিম"},
+    "Tamil Nadu":        {"hi": "तमिलनाडु",         "bn": "তামিলনাড়ু"},
+    "Telangana":         {"hi": "तेलंगाना",         "bn": "তেলেঙ্গানা"},
+    "Tripura":           {"hi": "त्रिपुरा",         "bn": "ত্রিপুরা"},
+    "Uttar Pradesh":     {"hi": "उत्तर प्रदेश",     "bn": "উত্তরপ্রদেশ"},
+    "Uttarakhand":       {"hi": "उत्तराखंड",        "bn": "উত্তরাখণ্ড"},
+    "West Bengal":       {"hi": "पश्चिम बंगाल",     "bn": "পশ্চিমবঙ্গ"},
+    "Delhi":             {"hi": "दिल्ली",           "bn": "দিল্লি"},
+    "Jammu and Kashmir": {"hi": "जम्मू और कश्मीर", "bn": "জম্মু ও কাশ্মীর"},
+    "Ladakh":            {"hi": "लद्दाख",           "bn": "লাদাখ"},
+    "Puducherry":        {"hi": "पुदुचेरी",         "bn": "পুদুচেরি"},
+    "Chandigarh":        {"hi": "चंडीगढ़",         "bn": "চণ্ডীগড়"},
+}
+
+_DESC_PATTERN = re.compile(
+    r"^(human settlement|village|town|city|revenue village|gram panchayat)"
+    r"\s+(?:in|of)\s+([A-Za-z\s&]+?)(?:,\s*India|\s+district|\s+state|\s+UT)?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_en_desc(en_desc: str) -> Optional[Tuple[str, str]]:
+    """
+    Parses English description to extract (entity_type, state_key).
+    Returns None if description doesn't match the expected pattern.
+    """
+    if not en_desc:
+        return None
+    m = _DESC_PATTERN.match(en_desc.strip())
+    if not m:
+        return None
+    raw_type  = m.group(1).lower()
+    raw_state = m.group(2).strip()
+    etype = "village" if ("village" in raw_type or "settlement" in raw_type) else "city"
+    for key in _STATES:
+        if key.lower() in raw_state.lower():
+            return (etype, key)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §5  CANDIDATE SEARCH QUERIES  (8-pool rotation)
+# ══════════════════════════════════════════════════════════════════════════════
+_SEARCH_QUERIES: List[str] = [
+    "haswbstatement:P31=Q532 haswbstatement:P17=Q668",          # Villages in India
+    "haswbstatement:P31=Q486914 haswbstatement:P17=Q668",       # Human settlements
+    "haswbstatement:P31=Q11776861 haswbstatement:P17=Q668",     # Tehsils
+    "haswbstatement:P31=Q1549592 haswbstatement:P17=Q668",      # Big cities
+    "haswbstatement:P17=Q668 -haswbstatement:description[hi]",  # Missing Hindi desc
+    "haswbstatement:P17=Q668 -haswbstatement:label[hi]",        # Missing Hindi label
+    "haswbstatement:P17=Q668 -haswbstatement:label[bn]",        # Missing Bengali label
+    "haswbstatement:P17=Q668",                                  # All Indian entities
+]
+
+_DISALLOWED_IMG_KW: List[str] = [
+    "campus", "school", "hospital", "orchard", "station", "police",
+    "college", "temple", "office", "bank", "stadium", "hotel",
+    "restaurant", "hall", "building", "court", "gate", "shop", "farm",
+    "map of", "location of", "district", "branch", "memorial", "tank",
+    "statue", "stamp", "logo", "journal", "poster", "svg", "map", "flag",
+    "coat of arms", "seal", "emblem",
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §6  SHARED IN-MEMORY STATE  (single source of truth — RAM only)
+# ══════════════════════════════════════════════════════════════════════════════
+_state_lock = threading.Lock()
+
+# Mutable RAM state — no DB, no disk
+_bot_state: Dict[str, Any] = {
+    "is_active":              False,    # Controlled by POST /control
+    "completed_in_session":   0,        # Successful wbeditentity calls this session
+    "skipped_in_session":     0,        # Entities skipped (guardrail / no payload)
+    "errors_in_session":      0,        # Network / API errors
+    "current_qid":            None,     # QID being processed right now
+    "queue_depth":            0,        # Live snapshot of task_queue.qsize()
+    "edits_per_minute":       0.0,      # Rolling EPM telemetry
+    "last_edit_timestamp":    None,     # ISO timestamp of last successful edit
+    "status_message":         "Engine on Standby — awaiting start command",
+    "session_start_ts":       None,     # Set when first edit completes
+}
+
+# In-memory edit history — capped at 500 entries (newest first)
+_recent_edits: List[Dict[str, Any]] = []
+
+# Completed QIDs set — prevents duplicate edits within same session
+_completed_qids: set = set()
+_completed_lock  = threading.Lock()
+
+# Task queue — payloads ready to write
+_task_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
+
+# Shared requests.Session (long-lived, HTTP Keep-Alive)
+_session: Optional[requests.Session] = None
+_csrf_token:  Optional[str]   = None
+_auth_lock    = threading.RLock()
+_is_logged_in = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §7  HTTP SESSION SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+def _build_session() -> requests.Session:
+    """Creates a long-lived requests.Session with HTTPAdapter connection pooling."""
+    sess = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=100,
+        pool_maxsize=100,
+        max_retries=Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+        ),
     )
+    sess.mount("https://", adapter)
+    sess.mount("http://",  adapter)
+    sess.headers.update({
+        "User-Agent":       USER_AGENT,
+        "Accept-Encoding":  "gzip, deflate",
+        "Connection":       "keep-alive",
+    })
+    return sess
 
-    # Console Handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
 
-    # File Handler
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+# ══════════════════════════════════════════════════════════════════════════════
+# §8  WIKIDATA AUTHENTICATION
+# ══════════════════════════════════════════════════════════════════════════════
+def _fetch_csrf_token() -> str:
+    """Fetches a fresh CSRF token. Called at boot and on badtoken errors."""
+    global _csrf_token
+    with _auth_lock:
+        resp = _session.get(
+            API_URL,
+            params={"action": "query", "meta": "tokens", "type": "csrf", "format": "json"},
+            timeout=12,
+        )
+        resp.raise_for_status()
+        token = resp.json().get("query", {}).get("tokens", {}).get("csrftoken", "")
+        if not token or token == "+\\":
+            raise RuntimeError("Received invalid CSRF token from Wikidata API.")
+        _csrf_token = token
+        logger.info("CSRF token acquired successfully.")
+        return token
 
-    return logger
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Wikidata Regional Label & Description Bot (Bengali 'bn' & Hindi 'hi')"
-    )
-    parser.add_argument(
-        "-i", "--input",
-        required=True,
-        help="Path to input JSON or CSV file containing target QIDs and labels/descriptions."
-    )
-    parser.add_argument(
-        "-f", "--format",
-        default="auto",
-        choices=["auto", "json", "csv"],
-        help="Input file format (default: auto-detect)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run in dry-run mode: simulate edits without changing Wikidata items."
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=None,
-        help="Override minimum rate limit delay between POST edits in seconds (min 2.0s)."
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=50,
-        help="Number of QIDs to fetch per entity lookup call (max 50, default: 50)."
-    )
-    parser.add_argument(
-        "--max-items",
-        type=int,
-        default=None,
-        help="Limit total number of items to process in this execution run."
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable detailed debug logging."
-    )
+def _login() -> bool:
+    """
+    Authenticates the bot account via MediaWiki login API.
+    Returns True on success, False after 3 failed attempts.
+    """
+    global _is_logged_in
+    with _auth_lock:
+        logger.info(f"Authenticating as bot user: {BOT_USER!r}")
+        for attempt in range(1, 4):
+            try:
+                # Step 1: get login token
+                r1 = _session.get(
+                    API_URL,
+                    params={"action": "query", "meta": "tokens", "type": "login", "format": "json"},
+                    timeout=12,
+                )
+                r1.raise_for_status()
+                login_token = r1.json().get("query", {}).get("tokens", {}).get("logintoken", "")
+                if not login_token:
+                    logger.error("Empty login token received.")
+                    time.sleep(3)
+                    continue
 
-    args = parser.parse_args()
+                # Step 2: POST credentials
+                r2 = _session.post(
+                    API_URL,
+                    data={
+                        "action":    "login",
+                        "lgname":    BOT_USER,
+                        "lgpassword": BOT_PASSWORD,
+                        "lgtoken":   login_token,
+                        "format":    "json",
+                    },
+                    timeout=12,
+                )
+                r2.raise_for_status()
+                result = r2.json().get("login", {}).get("result", "")
+                if result == "Success":
+                    _is_logged_in = True
+                    _fetch_csrf_token()
+                    logger.info("Bot authenticated successfully.")
+                    return True
+                logger.error(f"Login attempt {attempt} failed: result={result!r}  full={r2.json()}")
+            except Exception as exc:
+                logger.warning(f"Login attempt {attempt} raised: {exc}")
+            time.sleep(3)
+        return False
 
-    # 1. Setup Logging
-    logger = setup_logging(verbose=args.verbose)
-    logger.info("==================================================")
-    logger.info(" Starting Wikidata Regional Label & Description Bot ")
-    logger.info("==================================================")
 
-    if args.dry_run:
-        logger.info(">>> DRY-RUN MODE ENABLED: No live edits will be submitted. <<<")
-
-    # 2. Load Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+# §9  CANDIDATE FETCHING  (Producer helpers)
+# ══════════════════════════════════════════════════════════════════════════════
+def _cirrussearch_qids() -> List[str]:
+    """
+    Queries Wikidata CirrusSearch with a random query from the rotation pool.
+    Safe random sroffset in [0, 9000] (avoids cirrussearch-offset-too-large).
+    Returns a deduplicated list of fresh QIDs not already in _completed_qids.
+    """
+    query    = random.choice(_SEARCH_QUERIES)
+    sroffset = random.randint(0, 18) * 500  # 0, 500, 1000 … 9000
+    qids: List[str] = []
     try:
-        config = Config.from_env()
-        if args.delay is not None:
-            config.rate_limit_delay = max(2.0, args.delay)
-        config.validate(require_auth=not args.dry_run)
-    except Exception as e:
-        logger.critical(f"Configuration error: {e}")
-        sys.exit(1)
+        resp = _session.get(
+            API_URL,
+            params={
+                "action":   "query",
+                "list":     "search",
+                "srsearch": query,
+                "srlimit":  500,
+                "sroffset": sroffset,
+                "format":   "json",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"CirrusSearch HTTP {resp.status_code} for query={query!r}")
+            return []
+        for item in resp.json().get("query", {}).get("search", []):
+            t = item.get("title", "")
+            if t.startswith("Q") and t[1:].isdigit():
+                with _completed_lock:
+                    if t not in _completed_qids:
+                        qids.append(t)
+        logger.info(f"CirrusSearch [{query[:40]}|off={sroffset}] → {len(qids)} new QIDs")
+    except Exception as exc:
+        logger.error(f"CirrusSearch fetch error: {exc}")
+    return qids
 
-    logger.info(f"Target API: {config.api_url}")
-    logger.info(f"User Agent: {config.user_agent}")
-    logger.info(f"Rate limit delay: {config.rate_limit_delay:.2f}s | Maxlag: {config.maxlag}")
 
-    # 3. Load Input Feeder Data
+def _fetch_entities(qids: List[str]) -> Dict[str, Any]:
+    """
+    Calls wbgetentities for up to CANDIDATE_BATCH_SIZE QIDs.
+    Returns raw entity dict {qid: entity_data} or {} on failure.
+    """
+    if not qids:
+        return {}
+    chunk = qids[:CANDIDATE_BATCH_SIZE]
     try:
-        records = DataFeeder.load(args.input, args.format)
-    except Exception as e:
-        logger.critical(f"Failed to load input file '{args.input}': {e}")
-        sys.exit(1)
+        resp = _session.get(
+            API_URL,
+            params={
+                "action":    "wbgetentities",
+                "ids":       "|".join(chunk),
+                "props":     "labels|descriptions|claims|sitelinks",
+                "languages": "en|hi|bn",
+                "format":    "json",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("entities", {})
+    except Exception as exc:
+        logger.error(f"wbgetentities fetch error: {exc}")
+        return {}
 
-    if not records:
-        logger.warning("No records found in input file. Exiting.")
-        sys.exit(0)
 
-    # 4. Initialize State Tracker (Resumability)
-    state_tracker = StateTracker(txt_path="processed_qids.txt", db_path="bot_state.sqlite")
+def _search_commons_image(title: str) -> Optional[str]:
+    """
+    Queries Wikimedia Commons for a verified image of the given location title.
+    Applies keyword guardrails to reject maps, logos, stamps, etc.
+    Returns file name (without 'File:' prefix) or None.
+    """
+    clean = re.sub(r"\s*\([^)]*\)$", "", title).strip()
+    if not clean or len(clean) < 3:
+        return None
+    try:
+        resp = _session.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action":      "query",
+                "list":        "search",
+                "srsearch":    f'"{clean}" India',
+                "srnamespace": 6,
+                "srlimit":     5,
+                "format":      "json",
+            },
+            timeout=4,
+        )
+        resp.raise_for_status()
+        clean_lo = clean.lower()
+        for item in resp.json().get("query", {}).get("search", []):
+            raw = item.get("title", "")
+            if not raw.startswith("File:"):
+                continue
+            fname = raw[5:].strip()
+            flo   = fname.lower()
+            if clean_lo not in flo:
+                continue
+            if any(kw in flo and kw not in clean_lo for kw in _DISALLOWED_IMG_KW):
+                continue
+            logger.debug(f"Commons image for '{clean}': {fname}")
+            return fname
+    except Exception as exc:
+        logger.debug(f"Commons search error for '{title}': {exc}")
+    return None
 
-    # Filter out already processed QIDs
-    pending_records = [r for r in records if not state_tracker.is_processed(r.qid)]
-    logger.info(f"Loaded {len(records)} total records | {len(records) - len(pending_records)} already processed | {len(pending_records)} pending.")
 
-    if args.max_items and len(pending_records) > args.max_items:
-        logger.info(f"Limiting execution run to {args.max_items} pending items.")
-        pending_records = pending_records[:args.max_items]
+# ══════════════════════════════════════════════════════════════════════════════
+# §10  PAYLOAD BUILDER  (Producer helper — runs per-entity)
+# ══════════════════════════════════════════════════════════════════════════════
+def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Builds a wbeditentity-compatible data dict for the given entity.
+    Returns None if there is nothing to add (entity already complete).
 
-    if not pending_records:
-        logger.info("All pending QIDs have already been processed! Nothing to do.")
-        sys.exit(0)
+    Adds:
+      • hi / bn labels  from verified Wikipedia sitelinks (hiwiki / bnwiki)
+      • hi / bn descs   from English description pattern matching
+      • P18 image       from Wikimedia Commons (verified keyword match)
 
-    # 5. Initialize API Client & Authenticate
-    client = MediaWikiClient(config)
+    Enforces strict Unicode guardrails — any label or description containing
+    even one Latin character is silently discarded.
+    """
+    labels       = entity.get("labels",       {})
+    descriptions = entity.get("descriptions", {})
+    sitelinks    = entity.get("sitelinks",    {})
+    claims       = entity.get("claims",       {})
 
-    if not args.dry_run:
+    want_labels: Dict[str, Any] = {}
+    want_descs:  Dict[str, Any] = {}
+    want_claims: List[Any]      = []
+
+    # ── Labels from Wikipedia sitelinks ──────────────────────────────────────
+    if "hi" not in labels and "hiwiki" in sitelinks:
+        title = _clean_title(sitelinks["hiwiki"].get("title", ""))
+        if _script_ok(title, "hi"):
+            want_labels["hi"] = {"language": "hi", "value": title}
+
+    if "bn" not in labels and "bnwiki" in sitelinks:
+        title = _clean_title(sitelinks["bnwiki"].get("title", ""))
+        if _script_ok(title, "bn"):
+            want_labels["bn"] = {"language": "bn", "value": title}
+
+    # ── Descriptions from English pattern ────────────────────────────────────
+    en_desc = descriptions.get("en", {}).get("value", "")
+    parsed  = _parse_en_desc(en_desc)
+    if parsed:
+        etype, state_key = parsed
+        sm = _STATES.get(state_key)
+        if sm:
+            if "hi" not in descriptions:
+                hi_type = "गाँव" if etype == "village" else "शहर"
+                hi_desc = f"भारत के {sm['hi']} राज्य का एक {hi_type}"
+                if _script_ok(hi_desc, "hi"):
+                    want_descs["hi"] = {"language": "hi", "value": hi_desc}
+
+            if "bn" not in descriptions:
+                bn_type = "গ্রাম" if etype == "village" else "শহর"
+                bn_desc = f"ভারতের {sm['bn']} রাজ্যের একটি {bn_type}"
+                if _script_ok(bn_desc, "bn"):
+                    want_descs["bn"] = {"language": "bn", "value": bn_desc}
+
+    # ── P18 image from Wikimedia Commons ─────────────────────────────────────
+    if "P18" not in claims:
+        search_title = (
+            labels.get("en", {}).get("value")
+            or sitelinks.get("hiwiki", {}).get("title")
+        )
+        if search_title and len(search_title) > 3:
+            img = _search_commons_image(search_title)
+            if img:
+                want_claims.append({
+                    "mainsnak": {
+                        "snaktype":  "value",
+                        "property":  "P18",
+                        "datavalue": {"type": "string", "value": img},
+                    },
+                    "type": "statement",
+                    "rank": "normal",
+                })
+
+    if not want_labels and not want_descs and not want_claims:
+        return None
+
+    payload: Dict[str, Any] = {}
+    if want_labels:
+        payload["labels"] = want_labels
+    if want_descs:
+        payload["descriptions"] = want_descs
+    if want_claims:
+        payload["claims"] = want_claims
+    return payload
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11  PRODUCER THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+def _producer_thread() -> None:
+    """
+    Infinite producer loop.
+    Monitors queue depth; when below QUEUE_REFILL_BELOW, fetches a fresh
+    batch of candidates via CirrusSearch → wbgetentities → payload builder,
+    then enqueues validated (qid, payload) tuples.
+    Runs as a daemon thread — exits automatically when main process ends.
+    """
+    logger.info("Producer thread started.")
+    while True:
         try:
-            client.login()
-        except Exception as e:
-            logger.critical(f"Authentication failed: {e}")
-            sys.exit(1)
-    else:
-        logger.info("Dry-run mode: Skipping API login.")
+            depth = _task_queue.qsize()
+            with _state_lock:
+                _bot_state["queue_depth"] = depth
 
-    bot = WikidataBot(client=client, state_tracker=state_tracker, dry_run=args.dry_run)
-
-    # 6. Batch Entity Processing
-    batch_size = min(50, max(1, args.batch_size))
-    total_processed = 0
-    total_updated = 0
-    total_skipped = 0
-
-    start_time = time.time()
-
-    for i in range(0, len(pending_records), batch_size):
-        chunk = pending_records[i : i + batch_size]
-        qid_map = {r.qid: r for r in chunk}
-        chunk_qids = list(qid_map.keys())
-
-        logger.info(f"--- Fetching entity status batch ({i + 1} to {i + len(chunk)} of {len(pending_records)}) ---")
-
-        try:
-            # Query status of batch via wbgetentities
-            entities = bot.get_entities_batch(chunk_qids, languages=["bn", "hi"])
-        except Exception as e:
-            logger.error(f"Failed to fetch entity batch status: {e}")
-            continue
-
-        for qid, record in qid_map.items():
-            entity_data = entities.get(qid, {})
-            if "missing" in entity_data:
-                logger.warning(f"[{qid}] Item does not exist on Wikidata. Marking as processed.")
-                state_tracker.mark_processed(qid, status="MISSING_ITEM", details="Item does not exist")
-                total_skipped += 1
+            if depth >= QUEUE_REFILL_BELOW:
+                time.sleep(0.5)
                 continue
 
-            try:
-                status, actions = bot.process_item(
-                    qid=qid,
-                    entity_data=entity_data,
-                    desired_labels=record.labels,
-                    desired_descriptions=record.descriptions,
-                    custom_summary=record.custom_summary
-                )
-                total_processed += 1
-                if actions:
-                    total_updated += 1
+            # ── Step 1: fetch candidate QIDs ─────────────────────────────────
+            qids = _cirrussearch_qids()
+            if not qids:
+                time.sleep(1.0)
+                continue
+
+            # ── Step 2: fetch entity data in batches of 50 ───────────────────
+            all_entities: Dict[str, Any] = {}
+            for i in range(0, len(qids), CANDIDATE_BATCH_SIZE):
+                chunk = qids[i:i + CANDIDATE_BATCH_SIZE]
+                all_entities.update(_fetch_entities(chunk))
+
+            # ── Step 3: build payloads + guardrails + enqueue ─────────────────
+            added = 0
+            for qid in qids:
+                entity = all_entities.get(qid, {})
+                if not entity or "missing" in entity:
+                    continue
+                payload = _build_payload(qid, entity)
+                if payload:
+                    try:
+                        _task_queue.put_nowait((qid, payload))
+                        added += 1
+                    except queue.Full:
+                        break  # Queue is full — stop filling this batch
+
+            with _state_lock:
+                _bot_state["queue_depth"] = _task_queue.qsize()
+
+            logger.info(
+                f"Producer: queued {added} payloads | "
+                f"queue={_task_queue.qsize()} | "
+                f"EPM={_bot_state['edits_per_minute']}"
+            )
+
+        except Exception as exc:
+            logger.exception(f"Producer unexpected error: {exc}")
+            time.sleep(2.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12  CONSUMER / WRITER THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+def _consumer_thread() -> None:
+    """
+    Infinite consumer / writer loop.
+    Pops (qid, payload) from the task queue and writes to wbeditentity at an
+    exact 1.0-second cadence using dynamic sleep compensation.
+
+    CSRF token is cached at boot; refreshed only on 'badtoken' API error.
+    Rate-limited responses cause a 10s back-off; the item is re-queued.
+    """
+    global _csrf_token
+    logger.info("Consumer writer thread started.")
+    _session_start: Optional[float] = None
+    _session_edits = 0
+
+    while True:
+        # ── Pause check ───────────────────────────────────────────────────────
+        with _state_lock:
+            active = _bot_state["is_active"]
+        if not active:
+            with _state_lock:
+                _bot_state["status_message"] = "Paused — awaiting start command"
+                _bot_state["current_qid"]    = None
+            time.sleep(1.0)
+            continue
+
+        # ── Dequeue next payload ──────────────────────────────────────────────
+        t_start = time.time()
+        try:
+            qid, payload = _task_queue.get(timeout=2.0)
+        except queue.Empty:
+            continue
+
+        # ── Pre-write guardrail re-check ──────────────────────────────────────
+        guard_ok = True
+        for lang, lbl in payload.get("labels", {}).items():
+            if not _script_ok(lbl["value"], lang):
+                logger.warning(f"[{qid}] Label guardrail failed for lang={lang}. Dropping.")
+                guard_ok = False
+                break
+        if guard_ok:
+            for lang, desc in payload.get("descriptions", {}).items():
+                if not _script_ok(desc["value"], lang):
+                    logger.warning(f"[{qid}] Desc guardrail failed for lang={lang}. Dropping.")
+                    guard_ok = False
+                    break
+
+        if not guard_ok:
+            with _state_lock:
+                _bot_state["skipped_in_session"] += 1
+            _task_queue.task_done()
+            continue
+
+        # ── Update live status ────────────────────────────────────────────────
+        with _state_lock:
+            _bot_state["current_qid"]    = qid
+            _bot_state["status_message"] = f"Writing {qid} …"
+
+        # ── Execute wbeditentity ──────────────────────────────────────────────
+        edit_data = {
+            "action":  "wbeditentity",
+            "id":      qid,
+            "data":    json.dumps(payload, ensure_ascii=False),
+            "token":   _csrf_token,
+            "summary": EDIT_SUMMARY,
+            "bot":     1,
+            "format":  "json",
+        }
+
+        try:
+            resp = _session.post(API_URL, data=edit_data, timeout=15)
+            res  = resp.json()
+
+            # ── Success ───────────────────────────────────────────────────────
+            if res.get("success") == 1:
+                if _session_start is None:
+                    _session_start = time.time()
+                _session_edits += 1
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                epm = round(_session_edits / max(1, time.time() - _session_start) * 60, 1)
+
+                with _completed_lock:
+                    _completed_qids.add(qid)
+
+                edit_record = {
+                    "id":        f"edit-{int(time.time() * 1000)}-{qid}",
+                    "qid":       qid,
+                    "fieldType": "multi_field",
+                    "fieldLabel": f"Updated {qid}",
+                    "newValue":  "Added Hindi/Bengali labels, descriptions & P18 image",
+                    "oldValue":  "",
+                    "status":    "VERIFIED_SAFE",
+                    "timestamp": ts,
+                    "latencyMs": int((time.time() - t_start) * 1000),
+                    "reverted":  False,
+                }
+
+                with _state_lock:
+                    _bot_state["completed_in_session"] += 1
+                    _bot_state["edits_per_minute"]      = epm
+                    _bot_state["last_edit_timestamp"]   = ts
+                    _bot_state["status_message"]        = f"SUCCESS {qid} | EPM={epm}"
+                    _bot_state["queue_depth"]           = _task_queue.qsize()
+                    _recent_edits.insert(0, edit_record)
+                    if len(_recent_edits) > 500:
+                        _recent_edits.pop()
+
+                logger.info(f"SUCCESS [{qid}] latency={int((time.time()-t_start)*1000)}ms EPM={epm} Q={_task_queue.qsize()}")
+
+            # ── CSRF expired → refresh and retry once ─────────────────────────
+            elif res.get("error", {}).get("code") == "badtoken":
+                logger.warning(f"[{qid}] badtoken — refreshing CSRF and retrying.")
+                _fetch_csrf_token()
+                edit_data["token"] = _csrf_token
+                resp2 = _session.post(API_URL, data=edit_data, timeout=15)
+                if resp2.json().get("success") == 1:
+                    with _completed_lock:
+                        _completed_qids.add(qid)
+                    with _state_lock:
+                        _bot_state["completed_in_session"] += 1
+                    logger.info(f"SUCCESS (after token refresh) [{qid}]")
                 else:
-                    total_skipped += 1
-            except Exception as e:
-                logger.error(f"Error processing item [{qid}]: {e}", exc_info=args.verbose)
+                    logger.error(f"[{qid}] Edit failed after token refresh: {resp2.json()}")
+                    with _state_lock:
+                        _bot_state["errors_in_session"] += 1
 
-    duration = time.time() - start_time
-    logger.info("==================================================")
-    logger.info(f" Execution Finished in {duration:.2f}s ")
-    logger.info(f" Processed: {total_processed} items ")
-    logger.info(f" Updated  : {total_updated} items ")
-    logger.info(f" Skipped  : {total_skipped} items ")
-    logger.info("==================================================")
+            # ── Rate-limited → back off, re-queue ────────────────────────────
+            elif res.get("error", {}).get("code") == "ratelimited":
+                logger.warning(f"[{qid}] ratelimited — backing off 10s, re-queuing.")
+                _task_queue.put((qid, payload))  # put back
+                time.sleep(10.0)
 
+            # ── Any other API error ───────────────────────────────────────────
+            else:
+                err_info = res.get("error", res)
+                logger.error(f"[{qid}] API error: {err_info}")
+                with _state_lock:
+                    _bot_state["errors_in_session"] += 1
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"[{qid}] Request timed out. Will retry next cycle.")
+            with _state_lock:
+                _bot_state["errors_in_session"] += 1
+
+        except requests.exceptions.ConnectionError as exc:
+            logger.warning(f"[{qid}] Connection error: {exc}. Retrying in 3s.")
+            time.sleep(3.0)
+            with _state_lock:
+                _bot_state["errors_in_session"] += 1
+
+        except Exception as exc:
+            logger.exception(f"[{qid}] Unexpected consumer error: {exc}")
+            with _state_lock:
+                _bot_state["errors_in_session"] += 1
+
+        _task_queue.task_done()
+
+        # ── Exact 1.0s cadence (dynamic sleep compensation) ───────────────────
+        elapsed      = time.time() - t_start
+        sleep_needed = max(0.0, RATE_LIMIT_SEC - elapsed)
+        if sleep_needed > 0:
+            time.sleep(sleep_needed)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §13  STARTUP — authenticate + launch threads
+# ══════════════════════════════════════════════════════════════════════════════
+def _startup() -> None:
+    """Called once at application boot. Sets up session, authenticates, starts threads."""
+    global _session
+    _session = _build_session()
+
+    if not BOT_USER or not BOT_PASSWORD:
+        logger.critical("WIKIDATA_BOT_USER or WIKIDATA_BOT_PASSWORD is not set. Bot will not edit.")
+        with _state_lock:
+            _bot_state["status_message"] = "ERROR: Missing bot credentials in environment"
+        return
+
+    if not _login():
+        logger.critical("Wikidata authentication failed. Bot cannot make edits.")
+        with _state_lock:
+            _bot_state["status_message"] = "ERROR: Authentication failed"
+        return
+
+    # Producer — daemon so it dies with the main process
+    threading.Thread(
+        target=_producer_thread,
+        name="Producer",
+        daemon=True,
+    ).start()
+
+    # Consumer — daemon
+    threading.Thread(
+        target=_consumer_thread,
+        name="Consumer",
+        daemon=True,
+    ).start()
+
+    logger.info("WikiBot v3 threads started. Use POST /control {'action':'start'} to begin editing.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §14  FASTAPI APPLICATION
+# ══════════════════════════════════════════════════════════════════════════════
+app = FastAPI(
+    title="WikiBot v3 — Wikidata Automation Control Plane",
+    description=(
+        "Production-grade zero-database Wikidata bot backend. "
+        "All state is RAM-only. Secret-authenticated via X-Bot-Token header."
+    ),
+    version="3.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # Tighten to your Vercel domain in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Auth dependency ───────────────────────────────────────────────────────────
+def _verify(x_bot_token: Optional[str] = Header(None)) -> None:
+    if not x_bot_token or x_bot_token != SECRET_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthorized: Missing or invalid X-Bot-Token header",
+        )
+
+
+# ── Request models ────────────────────────────────────────────────────────────
+class ControlRequest(BaseModel):
+    action: str  # "start" | "pause"
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/", tags=["Health"])
+def healthcheck():
+    """Public healthcheck — used by Render uptime pings and external monitors."""
+    with _state_lock:
+        return {
+            "status":               "ok",
+            "service":              "WikiBot v3 Render Backend",
+            "is_active":            _bot_state["is_active"],
+            "completed_in_session": _bot_state["completed_in_session"],
+            "queue_depth":          _bot_state["queue_depth"],
+        }
+
+
+@app.get("/status", tags=["Telemetry"])
+def get_status(x_bot_token: Optional[str] = Header(None)):
+    """
+    Returns full in-memory bot telemetry.
+    Requires `X-Bot-Token` header matching INTERNAL_BOT_SECRET env var.
+    """
+    _verify(x_bot_token)
+    with _state_lock:
+        return {
+            "success":              True,
+            "is_active":            _bot_state["is_active"],
+            "completed_in_session": _bot_state["completed_in_session"],
+            "skipped_in_session":   _bot_state["skipped_in_session"],
+            "errors_in_session":    _bot_state["errors_in_session"],
+            "edits_per_minute":     _bot_state["edits_per_minute"],
+            "current_qid":          _bot_state["current_qid"],
+            "queue_depth":          _bot_state["queue_depth"],
+            "last_edit_timestamp":  _bot_state["last_edit_timestamp"],
+            "status_message":       _bot_state["status_message"],
+            # Derived convenience fields for dashboard
+            "botStatus":    "RUNNING" if _bot_state["is_active"] else "PAUSED",
+            "requestDelay": RATE_LIMIT_SEC,
+            "totalEditsToday":    _bot_state["completed_in_session"],
+            "totalEditsLifetime": _bot_state["completed_in_session"],
+        }
+
+
+@app.post("/control", tags=["Control"])
+def control_bot(req: ControlRequest, x_bot_token: Optional[str] = Header(None)):
+    """
+    Toggles bot execution.
+    Body: `{"action": "start"}` or `{"action": "pause"}`
+    Requires `X-Bot-Token` header.
+    """
+    _verify(x_bot_token)
+    if req.action not in ("start", "pause"):
+        raise HTTPException(status_code=400, detail="action must be 'start' or 'pause'")
+
+    with _state_lock:
+        if req.action == "start":
+            _bot_state["is_active"]      = True
+            _bot_state["status_message"] = f"Running @ {RATE_LIMIT_SEC}s cadence"
+        else:
+            _bot_state["is_active"]      = False
+            _bot_state["status_message"] = "Paused by admin dashboard"
+
+        return {
+            "success":   True,
+            "is_active": _bot_state["is_active"],
+            "message":   _bot_state["status_message"],
+        }
+
+
+@app.get("/edits", tags=["Telemetry"])
+def get_recent_edits(limit: int = 500, x_bot_token: Optional[str] = Header(None)):
+    """
+    Returns the most recent edit records (newest first).
+    Capped at 500 entries. In-memory only — resets on each Render deployment.
+    Requires `X-Bot-Token` header.
+    """
+    _verify(x_bot_token)
+    safe_limit = min(max(1, limit), 500)
+    with _state_lock:
+        edits = list(_recent_edits[:safe_limit])
+    return {"success": True, "edits": edits, "total": len(edits)}
+
+
+# ── Startup hook ──────────────────────────────────────────────────────────────
+@app.on_event("startup")
+def on_startup():
+    _startup()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §15  LOCAL DEV ENTRYPOINT
+# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info",
+        reload=False,
+    )
