@@ -45,12 +45,14 @@ export default function RecentChangesStream({ edits, onRollbackComplete }: Recen
     }
   };
 
-  const filteredEdits = edits.filter((item) => {
-    const matchesQuery = item.qid.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                         (item.newValue && item.newValue.toLowerCase().includes(searchQuery.toLowerCase()));
-    const matchesStatus = statusFilter === 'ALL' || item.status === statusFilter;
-    return matchesQuery && matchesStatus;
-  });
+  const filteredEdits = edits
+    .filter((item) => {
+      const matchesQuery = item.qid.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                           (item.newValue && item.newValue.toLowerCase().includes(searchQuery.toLowerCase()));
+      const matchesStatus = statusFilter === 'ALL' || item.status === statusFilter;
+      return matchesQuery && matchesStatus;
+    })
+    .slice(0, 25); // Show max 25 recent edits
 
   return (
     <div className="rounded-2xl bg-slate-900/70 border border-slate-800/80 backdrop-blur-xl shadow-2xl p-6 mb-8">
@@ -60,7 +62,10 @@ export default function RecentChangesStream({ edits, onRollbackComplete }: Recen
         <div>
           <div className="flex items-center space-x-2">
             <Zap className="w-5 h-5 text-indigo-400" />
-            <h2 className="text-lg font-bold text-white">Live Recent Changes & Audit Stream</h2>
+            <h2 className="text-lg font-bold text-white">Live Recent Changes &amp; Audit Stream</h2>
+            <span className="ml-1 px-2 py-0.5 text-xs font-bold rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+              {filteredEdits.length} / 25
+            </span>
           </div>
           <p className="text-xs text-slate-400 mt-1">
             Real-time edit monitor with automated script audit & 1-Click Rollback engine.
