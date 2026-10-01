@@ -161,31 +161,48 @@ _DESC_PATTERN = re.compile(
 )
 
 
-def _parse_en_desc(en_desc: str) -> Optional[Tuple[str, str]]:
+def _parse_en_desc(en_desc: str) -> Optional[Tuple[str, Optional[str]]]:
     """
-    Parses English description to extract (entity_type, state_key).
-    Matches any Indian state/UT name present in the English description.
+    Strict category parser using word-boundary regex matching.
+    Returns (category_code, state_key_or_None) or None if category is unrecognized.
+    Supported categories: university, college, school, station, village, city, tehsil, district.
     """
     if not en_desc or not isinstance(en_desc, str):
         return None
     desc_lo = en_desc.lower()
 
-    # Must be a settlement, village, town, city, panchayat, tehsil, mouza, or district location
-    settlement_keywords = [
-        "village", "settlement", "town", "city", "panchayat", "tehsil",
-        "block", "mouza", "locality", "district", "subdivision", "taluk", "taluka"
-    ]
-    if not any(kw in desc_lo for kw in settlement_keywords):
-        return None
+    # Category matching with strict word boundaries
+    cat = None
+    if re.search(r"\b(university|deemed university|central university|state university|private university)\b", desc_lo):
+        cat = "university"
+    elif re.search(r"\b(college|degree college|engineering college|medical college|polytechnic)\b", desc_lo):
+        cat = "college"
+    elif re.search(r"\b(school|high school|secondary school|primary school)\b", desc_lo):
+        cat = "school"
+    elif re.search(r"\b(railway station|train station|metro station)\b", desc_lo):
+        cat = "station"
+    elif re.search(r"\b(village|gram panchayat|revenue village|mouza|hamlet)\b", desc_lo):
+        cat = "village"
+    elif re.search(r"\b(town|city|municipality|census town|metropolis)\b", desc_lo):
+        cat = "city"
+    elif re.search(r"\b(tehsil|subdistrict|taluk|taluka|block|subdivision)\b", desc_lo):
+        cat = "tehsil"
+    elif re.search(r"\b(district)\b", desc_lo):
+        cat = "district"
+    elif re.search(r"\b(human settlement)\b", desc_lo):
+        cat = "village"
 
-    etype = "village" if any(kw in desc_lo for kw in ["village", "settlement", "mouza", "panchayat"]) else "city"
+    if not cat:
+        return None  # Unrecognized category — strictly skip to prevent wrong data
 
-    # Match state from _STATES dictionary directly from description string
-    for state_name in _STATES:
-        if state_name.lower() in desc_lo:
-            return (etype, state_name)
+    # State matching
+    state_key = None
+    for s_name in _STATES:
+        if s_name.lower() in desc_lo:
+            state_key = s_name
+            break
 
-    return None
+    return (cat, state_key)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -487,44 +504,75 @@ def _build_payload(qid: str, entity: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if _script_ok(title, "bn"):
             want_labels["bn"] = {"language": "bn", "value": title}
 
-    # ── Descriptions ─────────────────────────────────────────────────────────
+    # ── Strict Verified Category Descriptions ─────────────────────────────────
     en_desc = descriptions.get("en", {}).get("value", "")
     parsed  = _parse_en_desc(en_desc)
     if parsed:
-        etype, state_key = parsed
-        sm = _STATES.get(state_key)
-        if sm:
+        cat, state_key = parsed
+        sm = _STATES.get(state_key) if state_key else None
+
+        # Category Templates: (hi_with_state, hi_fallback, bn_with_state, bn_fallback)
+        templates = {
+            "university": (
+                "भारत के {state} राज्य में स्थित एक विश्वविद्यालय",
+                "भारत में स्थित एक विश्वविद्यालय",
+                "ভারতের {state} রাজ্যে অবস্থিত একটি বিশ্ববিদ্যালয়",
+                "ভারতের একটি বিশ্ববিদ্যালয়",
+            ),
+            "college": (
+                "भारत के {state} राज्य में स्थित एक कॉलेज",
+                "भारत में स्थित एक कॉलेज",
+                "ভারতের {state} রাজ্যে অবস্থিত একটি মহাবিদ্যালয়",
+                "ভারতের একটি মহাবিদ্যালয়",
+            ),
+            "school": (
+                "भारत के {state} राज्य में स्थित एक विद्यालय",
+                "भारत में स्थित एक विद्यालय",
+                "ভারতের {state} রাজ্যে অবস্থিত একটি বিদ্যালয়",
+                "ভারতের একটি বিদ্যালয়",
+            ),
+            "station": (
+                "भारत के {state} राज्य में स्थित एक रेलवे स्टेशन",
+                "भारत में स्थित एक रेलवे स्टेशन",
+                "ভারতের {state} রাজ্যে অবস্থিত একটি রেলওয়ে স্টেশন",
+                "ভারতের একটি রেলওয়ে স্টেশন",
+            ),
+            "village": (
+                "भारत के {state} राज्य का एक गाँव",
+                "भारत का एक गाँव",
+                "ভারতের {state} রাজ্যের একটি গ্রাম",
+                "ভারতের একটি গ্রাম",
+            ),
+            "city": (
+                "भारत के {state} राज्य का एक शहर",
+                "भारत का एक शहर",
+                "ভারতের {state} রাজ্যের একটি শহর",
+                "ভারতের একটি শহর",
+            ),
+            "tehsil": (
+                "भारत के {state} राज्य का एक तहसील",
+                "भारत का एक तहसील",
+                "ভারতের {state} রাজ্যের একটি তহশিল",
+                "ভারতের একটি তহশিল",
+            ),
+            "district": (
+                "भारत के {state} राज्य का एक ज़िला",
+                "भारत का एक ज़िला",
+                "ভারতের {state} রাজ্যের একটি जिला",
+                "ভারতের একটি জেলা",
+            ),
+        }
+
+        tmpl = templates.get(cat)
+        if tmpl:
+            hi_w_state, hi_fall, bn_w_state, bn_fall = tmpl
             if "hi" not in descriptions:
-                hi_type = "गाँव" if etype == "village" else "शहर"
-                hi_desc = f"भारत के {sm['hi']} राज्य का एक {hi_type}"
+                hi_desc = hi_w_state.format(state=sm["hi"]) if sm else hi_fall
                 if _script_ok(hi_desc, "hi"):
                     want_descs["hi"] = {"language": "hi", "value": hi_desc}
 
             if "bn" not in descriptions:
-                bn_type = "গ্রাম" if etype == "village" else "শহর"
-                bn_desc = f"ভারতের {sm['bn']} রাজ্যের একটি {bn_type}"
-                if _script_ok(bn_desc, "bn"):
-                    want_descs["bn"] = {"language": "bn", "value": bn_desc}
-    else:
-        # Fallback for Indian villages/settlements if state name is not in en_desc
-        is_india = False
-        for c in claims.get("P17", []):
-            if c.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id") == "Q668":
-                is_india = True
-                break
-
-        desc_lo = en_desc.lower() if en_desc else ""
-        is_settlement = is_india or any(kw in desc_lo for kw in ["village", "settlement", "town", "city", "panchayat", "tehsil"])
-
-        if is_settlement:
-            etype = "village" if (not desc_lo or any(kw in desc_lo for kw in ["village", "settlement", "panchayat"])) else "city"
-            if "hi" not in descriptions:
-                hi_desc = "भारत का एक गाँव" if etype == "village" else "भारत का एक शहर"
-                if _script_ok(hi_desc, "hi"):
-                    want_descs["hi"] = {"language": "hi", "value": hi_desc}
-
-            if "bn" not in descriptions:
-                bn_desc = "ভারতের একটি গ্রাম" if etype == "village" else "ভারতের একটি শহর"
+                bn_desc = bn_w_state.format(state=sm["bn"]) if sm else bn_fall
                 if _script_ok(bn_desc, "bn"):
                     want_descs["bn"] = {"language": "bn", "value": bn_desc}
 
