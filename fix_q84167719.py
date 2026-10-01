@@ -11,7 +11,7 @@ load_dotenv()
 
 API_URL = "https://www.wikidata.org/w/api.php"
 BOT_USER = "SHADOWARROW 2026@ShadowBot"
-BOT_PASSWORD = ""
+BOT_PASSWORD = os.getenv("WIKIDATA_BOT_PASSWORD", "").strip()
 USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026; contact: local-dev) python-requests"
 
 if hasattr(sys.stdout, "reconfigure"):
