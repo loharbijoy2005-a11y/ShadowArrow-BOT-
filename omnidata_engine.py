@@ -249,18 +249,26 @@ class OmniDataEngine:
                 time.sleep(2)
             return False
 
+    SEARCH_QUERIES = [
+        "haswbstatement:P31=Q532 haswbstatement:P17=Q668",      # Villages in India
+        "haswbstatement:P31=Q486914 haswbstatement:P17=Q668",   # Settlements in India
+        "haswbstatement:P31=Q11776861 haswbstatement:P17=Q668", # Tehsils/Subdistricts in India
+        "haswbstatement:P31=Q1549592 haswbstatement:P17=Q668",  # Districts in India
+        "haswbstatement:P17=Q668"                               # All Indian entities
+    ]
+
     def fetch_candidates_batch(self, offset: int = 0) -> List[str]:
-        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch & SPARQL pagination."""
+        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch query rotation."""
         qids = []
+        query = self.SEARCH_QUERIES[(offset // 500) % len(self.SEARCH_QUERIES)]
         
-        # 1. MediaWiki CirrusSearch for Indian entities (P17=Q668) with pagination
         try:
             search_params = {
                 "action": "query",
                 "list": "search",
-                "srsearch": "haswbstatement:P17=Q668",
+                "srsearch": query,
                 "srlimit": 500,
-                "sroffset": offset % 10000,
+                "sroffset": (offset // len(self.SEARCH_QUERIES)) % 10000,
                 "format": "json"
             }
             s_resp = self.session.get(self.config.api_url, params=search_params, timeout=15)
@@ -270,35 +278,9 @@ class OmniDataEngine:
                     title = item.get("title", "")
                     if title.startswith("Q") and title[1:].isdigit() and title not in self.completed_qids:
                         qids.append(title)
-            logger.info(f"CirrusSearch returned {len(qids)} pending QIDs (sroffset={offset}).")
+            logger.info(f"CirrusSearch [{query}] returned {len(qids)} fresh candidate QIDs.")
         except Exception as e:
             logger.error(f"CirrusSearch fetch error: {e}")
-
-        # 2. If CirrusSearch yielded few items, query SPARQL as fallback
-        if len(qids) < 50:
-            sparql_url = "https://query.wikidata.org/sparql"
-            query = f"""
-            SELECT DISTINCT ?item WHERE {{
-              ?item wdt:P17 wd:Q668 .
-            }} LIMIT 500 OFFSET {offset % 5000}
-            """
-            headers = {
-                "User-Agent": self.config.user_agent,
-                "Accept": "application/sparql-results+json"
-            }
-            try:
-                resp = requests.get(sparql_url, params={"query": query, "format": "json"}, headers=headers, timeout=15)
-                if resp.status_code == 200:
-                    results = resp.json().get("results", {}).get("bindings", [])
-                    for item in results:
-                        uri = item.get("item", {}).get("value", "")
-                        if "/Q" in uri:
-                            qid = uri.split("/")[-1]
-                            if qid not in self.completed_qids:
-                                qids.append(qid)
-                logger.info(f"SPARQL fallback returned {len(qids)} pending QIDs.")
-            except Exception as e:
-                logger.debug(f"SPARQL fetch notice: {e}")
 
         return qids
 
@@ -307,26 +289,26 @@ class OmniDataEngine:
         return self.fetch_candidates_batch(offset=0)
 
     def producer_loop(self):
-        """Thread A: Infinite worker that continuously pre-fetches and queues valid edit payloads."""
+        """Thread A: Infinite worker that pre-fetches and queues valid edit payloads with 25-thread pool."""
         from concurrent.futures import ThreadPoolExecutor
-        logger.info("Producer infinite worker thread started.")
+        logger.info("Producer infinite worker thread started (25-Thread Mode).")
         offset = 0
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=25) as executor:
             while True:
-                # Keep queue buffered up to 200 items
-                if self.task_queue.qsize() > 150:
-                    time.sleep(2.0)
+                # Buffer queue up to 250 candidates
+                if self.task_queue.qsize() > 200:
+                    time.sleep(1.0)
                     continue
 
                 qids = self.fetch_candidates_batch(offset=offset)
                 offset += 500
-                if offset >= 20000:
+                if offset >= 50000:
                     offset = 0  # Wrap around
 
                 if not qids:
-                    logger.info("No candidates returned in chunk. Sleeping 5 seconds before retrying...")
-                    time.sleep(5.0)
+                    logger.info("No candidates returned in chunk. Retrying next query offset...")
+                    time.sleep(1.0)
                     continue
 
                 batch_size = 50
@@ -355,7 +337,7 @@ class OmniDataEngine:
                         except Exception as e:
                             logger.error(f"Error preparing payload for {qid}: {e}")
 
-                logger.info(f"Producer chunk complete: Queued {added_count} valid payloads. Total Queue Size: {self.task_queue.qsize()}")
+                logger.info(f"Producer batch complete: Queued {added_count} payloads. Total Queue Size: {self.task_queue.qsize()}")
 
         logger.info("Producer thread exiting.")
 
