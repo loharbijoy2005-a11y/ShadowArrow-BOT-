@@ -7,6 +7,7 @@ import ExecutiveMetrics from '@/components/ExecutiveMetrics';
 import RecentChangesStream from '@/components/RecentChangesStream';
 import EntityInspector from '@/components/EntityInspector';
 import { EditRecord } from '@/app/api/edits/route';
+import { Globe, ShieldCheck, Heart } from 'lucide-react';
 
 export default function DashboardHome() {
   const [botStatus, setBotStatus] = useState<'RUNNING' | 'PAUSED' | 'RATE_LIMITED'>('PAUSED');
@@ -65,7 +66,7 @@ export default function DashboardHome() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-indigo-500 selection:text-white">
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-blue-600 selection:text-white">
       
       {/* Navbar Header */}
       <Header
@@ -100,9 +101,26 @@ export default function DashboardHome() {
 
       </main>
 
-      {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950 py-6 text-center text-xs text-slate-500">
-        <p>Wikidata Automation Engine v2.0 • Sitelink-Only Verified Architecture • 100% Policy Compliant</p>
+      {/* Authentic Wikimedia Style Footer */}
+      <footer className="border-t border-slate-900 bg-slate-950 py-8 text-center text-xs text-slate-500">
+        <div className="max-w-7xl mx-auto px-4 flex flex-col md:flex-row items-center justify-between gap-4 font-mono">
+          <div className="flex items-center space-x-2 text-slate-400">
+            <Globe className="w-4 h-4 text-blue-400" />
+            <span>Wikimedia Cloud Toolforge Operator • Bot: <strong>SHADOWARROW_2026</strong></span>
+          </div>
+          <div className="flex items-center space-x-4">
+            <a
+              href="https://www.wikidata.org/wiki/Wikidata:Bots"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-blue-400 transition-colors flex items-center"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 mr-1 text-emerald-400" /> Wikidata Bot Policy
+            </a>
+            <span>•</span>
+            <span className="text-slate-400">Rate Limit: <strong>0.8s Safe Interval</strong></span>
+          </div>
+        </div>
       </footer>
 
     </div>
