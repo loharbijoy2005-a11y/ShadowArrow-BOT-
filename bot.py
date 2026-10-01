@@ -3,16 +3,26 @@ import re
 import sys
 import time
 import json
+import queue
 import random
 import logging
 import unicodedata
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 import requests
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Thread Synchronization & Queue Architecture
+state_lock = threading.Lock()
+auth_lock = threading.RLock()
+
+# Thread-Safe Pipeline Queue (Pre-fetched & pre-validated edit payloads)
+edit_queue: queue.Queue = queue.Queue(maxsize=100)
 
 # API & Bot Configuration
 API_URL = os.getenv("WIKIDATA_API_URL", "https://www.wikidata.org/w/api.php").strip()
@@ -24,7 +34,7 @@ USER_AGENT = "ShadowBot/1.0 (https://www.wikidata.org/wiki/User:SHADOWARROW_2026
 STATE_FILE = "completed_qids.txt"
 LOG_FILE = "bot_execution.log"
 
-RATE_LIMIT_DELAY = 1.8  # Safe 1.8s delay between writes
+CONSUMER_WRITE_DELAY = 0.8  # Strict 0.8s throttle for single consumer thread
 MAXLAG = 5
 MAX_RETRIES = 5
 BATCH_FETCH_SIZE = 50
@@ -42,13 +52,23 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+class FlushStreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+class FlushFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, encoding="utf-8")
+        FlushStreamHandler(sys.stdout),
+        FlushFileHandler(LOG_FILE, encoding="utf-8")
     ]
 )
 logger = logging.getLogger("WikidataBot")
@@ -67,7 +87,7 @@ INDIAN_STATES = {
     "Jharkhand": {"hi": "झारखंड", "bn": "ঝাড়খণ্ড"},
     "Karnataka": {"hi": "कर्नाटक", "bn": "কর্ণাটক"},
     "Kerala": {"hi": "केरल", "bn": "কেরালা"},
-    "Madhya Pradesh": {"hi": "मध्य प्रदेश", "bn": "मध्यप्रदेश"},
+    "Madhya Pradesh": {"hi": "मध्य प्रदेश", "bn": "মধ্যপ্রদেশ"},
     "Maharashtra": {"hi": "महाराष्ट्र", "bn": "মহারাষ্ট্র"},
     "Manipur": {"hi": "मणिपुर", "bn": "মণিপুর"},
     "Meghalaya": {"hi": "मेघालय", "bn": "মেঘালয়"},
@@ -76,19 +96,19 @@ INDIAN_STATES = {
     "Odisha": {"hi": "ओडिशा", "bn": "ওড়িশা"},
     "Orissa": {"hi": "ओडिशा", "bn": "ওড়িশা"},
     "Punjab": {"hi": "पंजाब", "bn": "পাঞ্জাব"},
-    "Rajasthan": {"hi": "राजस्थान", "bn": "राजस्थान"},
+    "Rajasthan": {"hi": "राजस्थान", "bn": "রাজস্থান"},
     "Sikkim": {"hi": "सिक्किम", "bn": "সিকিম"},
     "Tamil Nadu": {"hi": "तमिलनाडु", "bn": "তামিলনাড়ু"},
-    "Telangana": {"hi": "तेलंगाना", "bn": "तेलेंगाना"},
-    "Tripura": {"hi": "त्रिपुरा", "bn": "त्रिपुरा"},
-    "Uttar Pradesh": {"hi": "उत्तर प्रदेश", "bn": "उत्तरप्रदेश"},
+    "Telangana": {"hi": "तेलंगाना", "bn": "তেলেঙ্গানা"},
+    "Tripura": {"hi": "त्रिपुरा", "bn": "ত্রিপুরা"},
+    "Uttar Pradesh": {"hi": "उत्तर प्रदेश", "bn": "উত্তরপ্রদেশ"},
     "Uttarakhand": {"hi": "उत्तराखंड", "bn": "উত্তরাখণ্ড"},
     "West Bengal": {"hi": "पश्चिम बंगाल", "bn": "পশ্চিমবঙ্গ"},
     "Delhi": {"hi": "दिल्ली", "bn": "দিল্লি"},
     "Jammu and Kashmir": {"hi": "जम्मू और कश्मीर", "bn": "জম্মু ও কাশ্মীর"},
     "Ladakh": {"hi": "लद्दाख", "bn": "লাদাখ"},
     "Puducherry": {"hi": "पुदुचेरी", "bn": "পুদুচেরি"},
-    "Chandigarh": {"hi": "चंडीगढ़", "bn": "चंडीगढ़"}
+    "Chandigarh": {"hi": "चंडीगढ़", "bn": "চণ্ডীগড়"}
 }
 
 def validate_script(text: str, lang: str) -> bool:
@@ -101,14 +121,16 @@ def validate_script(text: str, lang: str) -> bool:
     if not text or not isinstance(text, str):
         return False
 
-    # Hard rejection of any English/Latin letters
     if LATIN_ALPHABET_REGEX.search(text):
         return False
 
+    has_bn = bool(BENGALI_SCRIPT_REGEX.search(text))
+    has_hi = bool(DEVANAGARI_SCRIPT_REGEX.search(text))
+
     if lang == "bn":
-        return bool(BENGALI_SCRIPT_REGEX.search(text))
+        return has_bn and not has_hi
     elif lang == "hi":
-        return bool(DEVANAGARI_SCRIPT_REGEX.search(text))
+        return has_hi and not has_bn
 
     return False
 
@@ -116,7 +138,6 @@ def clean_sitelink_title(title: str) -> str:
     """Strips disambiguation parentheses, e.g. 'Ahmedabad (city)' -> 'Ahmedabad'."""
     if not title or not isinstance(title, str):
         return ""
-    # Remove trailing parenthetical disambiguation
     cleaned = re.sub(r'\s*\([^)]*\)$', '', title).strip()
     return unicodedata.normalize('NFC', cleaned)
 
@@ -176,7 +197,7 @@ def generate_localized_descriptions(entity_type: str, state_name: str) -> Option
     elif entity_type == 'river':
         return {
             "hi": f"भारत के {state_hi} राज्य की एक नदी",
-            "bn": f"ভারতের {state_bn} রাজ্যের একটি নদী"
+            "bn": f"ভারতের {state_bn} রাজ্যের একটি नदी"
         }
 
     return None
@@ -184,9 +205,20 @@ def generate_localized_descriptions(entity_type: str, state_name: str) -> Option
 class ZeroErrorWikidataEngine:
     def __init__(self):
         self.session = requests.Session()
+        # High-Performance Keep-Alive HTTP Connection Pool to eliminate TCP/SSL Handshake Overhead
+        adapter = HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=20,
+            max_retries=3,
+            pool_block=False
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.session.headers.update({"User-Agent": USER_AGENT})
+
         self.csrf_token: Optional[str] = None
         self.completed_qids = self._load_completed_qids()
+        self.is_running = True
 
     def _load_completed_qids(self) -> set:
         completed = set()
@@ -204,15 +236,16 @@ class ZeroErrorWikidataEngine:
 
     def _mark_completed(self, qid: str):
         qid_clean = qid.strip().upper()
-        if qid_clean in self.completed_qids:
-            return
-        self.completed_qids.add(qid_clean)
-        try:
-            with open(STATE_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{qid_clean}\n")
-                f.flush()
-        except Exception as e:
-            logger.error(f"[State] Failed recording QID {qid_clean}: {e}")
+        with state_lock:
+            if qid_clean in self.completed_qids:
+                return
+            self.completed_qids.add(qid_clean)
+            try:
+                with open(STATE_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"{qid_clean}\n")
+                    f.flush()
+            except Exception as e:
+                logger.error(f"[State] Failed recording QID {qid_clean}: {e}")
 
     def request_mediawiki(self, method: str, params: dict = None, data: dict = None, is_write: bool = False) -> dict:
         params = params or {}
@@ -229,7 +262,6 @@ class ZeroErrorWikidataEngine:
             attempt += 1
             try:
                 if method.upper() == "POST":
-                    time.sleep(RATE_LIMIT_DELAY)
                     res = self.session.post(API_URL, params=params, data=data, timeout=30)
                 else:
                     res = self.session.get(API_URL, params=params, timeout=30)
@@ -252,8 +284,8 @@ class ZeroErrorWikidataEngine:
 
                     is_throttled = any("actionthrottledtext" in str(m) for m in messages)
                     if is_throttled:
-                        logger.warning(f"[Wikimedia Anti-Abuse Rate Throttle] Pausing for 20.0s before retry...")
-                        time.sleep(20.0)
+                        logger.warning(f"[Wikimedia Anti-Abuse Rate Throttle] Pausing for 15.0s before retry...")
+                        time.sleep(15.0)
                         continue
 
                     if err_code == "maxlag":
@@ -280,83 +312,68 @@ class ZeroErrorWikidataEngine:
         return {}
 
     def login(self) -> bool:
-        """Performs 2-Stage MediaWiki Authentication and stores CSRF token ONCE for session reuse."""
-        logger.info(f"[Auth] Authenticating as bot user: '{BOT_USER}'...")
-        res_token = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "login"})
-        login_token = res_token.get("query", {}).get("tokens", {}).get("logintoken")
+        """Log in with Action API action=login using Bot Account credentials."""
+        with auth_lock:
+            logger.info(f"[Auth] Authenticating as bot user: '{BOT_USER}'...")
+            res_token = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "login"})
+            login_token = res_token.get("query", {}).get("tokens", {}).get("logintoken")
 
-        if not login_token:
-            raise RuntimeError("Failed to obtain logintoken.")
+            if not login_token:
+                raise RuntimeError("Failed to obtain logintoken.")
 
-        login_res = self.request_mediawiki("POST", data={
-            "action": "login",
-            "lgname": BOT_USER,
-            "lgpassword": BOT_PASSWORD,
-            "lgtoken": login_token
-        })
-        if login_res.get("login", {}).get("result") != "Success":
-            raise RuntimeError(f"Login failed: {login_res}")
+            login_res = self.request_mediawiki("POST", data={
+                "action": "login",
+                "lgname": BOT_USER,
+                "lgpassword": BOT_PASSWORD,
+                "lgtoken": login_token
+            })
+            if login_res.get("login", {}).get("result") != "Success":
+                raise RuntimeError(f"Login failed: {login_res}")
 
-        logger.info("[Auth] Successfully authenticated with MediaWiki Action API.")
-        self.refresh_csrf_token()
-        return True
+            logger.info("[Auth] Successfully authenticated with MediaWiki Action API.")
+            self.refresh_csrf_token()
+            return True
 
     def refresh_csrf_token(self) -> str:
-        """Fetches one-time CSRF token for write operations."""
-        logger.debug("[Auth] Fetching session CSRF token...")
-        res = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "csrf"})
-        token = res.get("query", {}).get("tokens", {}).get("csrftoken")
+        """Fetches session CSRF token for write operations."""
+        with auth_lock:
+            logger.debug("[Auth] Fetching session CSRF token...")
+            res = self.request_mediawiki("GET", params={"action": "query", "meta": "tokens", "type": "csrf"})
+            token = res.get("query", {}).get("tokens", {}).get("csrftoken")
 
-        if not token or token == "+\\":
-            raise RuntimeError("Obtained invalid CSRF token.")
+            if not token or token == "+\\":
+                raise RuntimeError("Obtained invalid CSRF token.")
 
-        self.csrf_token = token
-        logger.debug("[Auth] Session CSRF token stored.")
-        return token
+            self.csrf_token = token
+            logger.debug("[Auth] Session CSRF token stored.")
+            return token
 
     def fetch_sparql_batch(self) -> List[str]:
-        """Queries SPARQL Query Service with automatic MediaWiki API random generator fallback."""
-        queries = [
-            """
-            SELECT ?item WHERE {
-              ?item wdt:P31 wd:Q515 . # City
-              ?item wdt:P17 wd:Q668 . # India
-              FILTER NOT EXISTS { ?item schema:description ?bnDesc . FILTER(LANG(?bnDesc) = "bn") }
-            } LIMIT 200
-            """,
-            """
-            SELECT ?item WHERE {
-              ?item wdt:P31 wd:Q4022 . # River
-              ?item wdt:P17 wd:Q668 .  # India
-              FILTER NOT EXISTS { ?item schema:description ?bnDesc . FILTER(LANG(?bnDesc) = "bn") }
-            } LIMIT 200
-            """
+        """Queries MediaWiki Action API search generator for instant Indian locality QIDs (<150ms)."""
+        search_terms = [
+            '"city in India"', '"village in India"', '"district in India"', 
+            '"river in India"', '"town in India"', '"human settlement in India"',
+            '"subdistrict in India"', '"railway station in India"', '"building in India"',
+            '"temple in India"', '"mountain in India"', '"village in West Bengal"',
+            '"village in Uttar Pradesh"', '"village in Bihar"', '"town in Maharashtra"',
+            '"village in Rajasthan"', '"village in Madhya Pradesh"', '"village in Gujarat"',
+            '"village in Tamil Nadu"', '"village in Kerala"', '"village in Karnataka"',
+            '"village in Assam"', '"village in Odisha"', '"village in Punjab"',
+            '"village in Haryana"', '"village in Jharkhand"', '"village in Uttarakhand"'
         ]
-
-        selected_query = random.choice(queries)
-
-        try:
-            res = requests.get(SPARQL_URL, params={"query": selected_query, "format": "json"}, headers={"User-Agent": USER_AGENT}, timeout=10)
-            if res.status_code == 200:
-                bindings = res.json().get("results", {}).get("bindings", [])
-                qids = []
-                for b in bindings:
-                    uri = b.get("item", {}).get("value", "")
-                    if "/entity/" in uri:
-                        qids.append(uri.split("/entity/")[-1])
-                if qids:
-                    return qids
-        except Exception as e:
-            logger.warning(f"[SPARQL Lag] {e}. Switching to MediaWiki Action API generator...")
+        term = random.choice(search_terms)
+        off = random.randint(0, 450)
 
         res = self.request_mediawiki("GET", params={
             "action": "query",
-            "list": "random",
-            "rnnamespace": "0",
-            "rnlimit": "50"
+            "list": "search",
+            "srsearch": term,
+            "srnamespace": "0",
+            "srlimit": "500",
+            "sroffset": str(off)
         })
-        random_items = res.get("query", {}).get("random", [])
-        return [item["title"] for item in random_items if item.get("title", "").startswith("Q")]
+        search_items = res.get("query", {}).get("search", [])
+        return [item["title"] for item in search_items if item.get("title", "").startswith("Q")]
 
     def fetch_entities_batch(self, qids_chunk: List[str]) -> Dict[str, Any]:
         """Fetches up to 50 QIDs in a SINGLE HTTP GET query using action=wbgetentities with sitelinks."""
@@ -373,18 +390,18 @@ class ZeroErrorWikidataEngine:
         res = self.request_mediawiki("GET", params=params)
         return res.get("entities", {})
 
-    def process_item_atomic(self, qid: str, entity_data: dict) -> bool:
+    def prepare_edit_payload(self, qid: str, entity_data: dict) -> Optional[Tuple[str, dict, List[str]]]:
         """
-        Idempotency Check & Atomic Multi-Field Update (`action=wbeditentity`).
-        SITELINK-ONLY LABELS: Uses bnwiki and hiwiki Wikipedia sitelinks exclusively. Zero transliteration guesswork.
-        Strict Script Guardrails: Drops any field containing Latin characters or missing required script.
+        Producer Task: Pre-fetches, evaluates sitelinks & state descriptions, validates script rules,
+        and returns a fully prepared payload tuple: (qid, edit_payload, fields_updated) or None.
         """
-        if qid in self.completed_qids:
-            return False
+        with state_lock:
+            if qid.upper() in self.completed_qids:
+                return None
 
         if "missing" in entity_data:
             self._mark_completed(qid)
-            return False
+            return None
 
         labels = entity_data.get("labels", {})
         descriptions = entity_data.get("descriptions", {})
@@ -397,8 +414,7 @@ class ZeroErrorWikidataEngine:
         payload_descriptions = {}
         fields_updated = []
 
-        # 1. Label Extraction (SITELINK-ONLY MODE - ZERO TRANSLITERATION GUESSWORK)
-        # Process Hindi Label
+        # 1. Label Extraction from verified Wikipedia sitelinks (bnwiki, hiwiki)
         if "hi" not in labels:
             hi_sitelink = sitelinks.get("hiwiki", {}).get("title", "").strip()
             if hi_sitelink:
@@ -407,7 +423,6 @@ class ZeroErrorWikidataEngine:
                     payload_labels["hi"] = {"language": "hi", "value": clean_hi}
                     fields_updated.append("hi_label")
 
-        # Process Bengali Label
         if "bn" not in labels:
             bn_sitelink = sitelinks.get("bnwiki", {}).get("title", "").strip()
             if bn_sitelink:
@@ -434,47 +449,108 @@ class ZeroErrorWikidataEngine:
                             payload_descriptions["hi"] = {"language": "hi", "value": hi_desc_val}
                             fields_updated.append("hi_desc")
 
-        # Assemble atomic payload
         if payload_labels:
             edit_payload["labels"] = payload_labels
         if payload_descriptions:
             edit_payload["descriptions"] = payload_descriptions
 
-        # Skip edit entirely if both labels and descriptions end up empty
         if not edit_payload:
             self._mark_completed(qid)
-            return False
+            return None
 
-        # Execute Single Atomic POST Edit via action=wbeditentity
-        if not self.csrf_token:
-            self.refresh_csrf_token()
+        return (qid, edit_payload, fields_updated)
 
-        start_time = time.time()
-        post_data = {
-            "action": "wbeditentity",
-            "id": qid,
-            "data": json.dumps(edit_payload, ensure_ascii=False),
-            "summary": EDIT_SUMMARY,
-            "token": self.csrf_token,
-            "bot": "1"
-        }
+    def producer_loop(self):
+        """
+        Thread 1 (Pre-fetcher Producer):
+        Continuously fetches QIDs & entity status, pre-prepares edit payloads,
+        and pushes validated edit payloads into edit_queue.
+        """
+        logger.info("[Producer] Pre-fetcher Producer Thread started.")
+        while self.is_running:
+            try:
+                qids = self.fetch_sparql_batch()
+                with state_lock:
+                    pending_qids = [q for q in qids if q.upper() not in self.completed_qids]
 
-        res = self.request_mediawiki("POST", data=post_data, is_write=True)
-        latency = time.time() - start_time
+                if not pending_qids:
+                    time.sleep(1)
+                    continue
 
-        if res.get("success") == 1:
-            fields_str = "+".join(fields_updated)
-            logger.info(f"QID: {qid} | Action: Updated {fields_str} | Latency: {latency:.2f}s | Status: OK")
-            self._mark_completed(qid)
-            return True
-        else:
-            logger.error(f"QID: {qid} | Action: Failed atomic edit | Latency: {latency:.2f}s | Response: {res}")
-            return False
+                queued_count = 0
+                for i in range(0, len(pending_qids), BATCH_FETCH_SIZE):
+                    if not self.is_running:
+                        break
+                    chunk = pending_qids[i : i + BATCH_FETCH_SIZE]
+                    entities_batch = self.fetch_entities_batch(chunk)
+
+                    for qid in chunk:
+                        if not self.is_running:
+                            break
+                        entity_data = entities_batch.get(qid, {})
+                        prepared = self.prepare_edit_payload(qid, entity_data)
+                        if prepared:
+                            edit_queue.put(prepared)
+                            queued_count += 1
+
+                if queued_count > 0:
+                    logger.info(f"[Producer] Queued {queued_count} prepared edit payloads | Queue Depth: {edit_queue.qsize()}")
+
+            except Exception as e:
+                logger.error(f"[Producer Error] {e}")
+                time.sleep(2)
+
+    def consumer_loop(self):
+        """
+        Thread 2 (Fast Submitter Consumer):
+        Pops prepared edit payloads from edit_queue, executes action=wbeditentity POST,
+        and strictly enforces 0.8s write delay to maximize edit throughput.
+        """
+        logger.info("[Consumer] Fast Submitter Consumer Thread started.")
+        while self.is_running:
+            try:
+                try:
+                    qid, edit_payload, fields_updated = edit_queue.get(timeout=2)
+                except queue.Empty:
+                    continue
+
+                if not self.csrf_token:
+                    self.refresh_csrf_token()
+
+                start_time = time.time()
+                post_data = {
+                    "action": "wbeditentity",
+                    "id": qid,
+                    "data": json.dumps(edit_payload, ensure_ascii=False),
+                    "summary": EDIT_SUMMARY,
+                    "token": self.csrf_token,
+                    "bot": "1"
+                }
+
+                # Hard Throttle: strictly 0.8s delay between write requests
+                time.sleep(CONSUMER_WRITE_DELAY)
+
+                res = self.request_mediawiki("POST", data=post_data, is_write=True)
+                latency = time.time() - start_time
+
+                if res.get("success") == 1:
+                    fields_str = "+".join(fields_updated)
+                    logger.info(f"QID: {qid} | Action: Updated {fields_str} | Latency: {latency:.2f}s | Status: OK")
+                    self._mark_completed(qid)
+                else:
+                    logger.error(f"QID: {qid} | Action: Failed atomic edit | Latency: {latency:.2f}s | Response: {res}")
+
+                edit_queue.task_done()
+
+            except Exception as e:
+                logger.error(f"[Consumer Error] {e}")
+                time.sleep(1)
 
 def main():
     logger.info("==========================================================")
-    logger.info(" Starting Zero-Error Wikidata Engine (bot.py) ")
-    logger.info(" Mode: Sitelink-Only Labels + State Descriptions | Delay: 1.8s ")
+    logger.info(" Starting Producer-Consumer High-Throughput Engine (bot.py) ")
+    logger.info(" Architecture: Thread-safe Queue + Keep-Alive Connection Pool ")
+    logger.info(" Throttle: Strict 0.8s Write Delay | Pre-fetcher Active ")
     logger.info("==========================================================")
 
     bot = ZeroErrorWikidataEngine()
@@ -485,27 +561,20 @@ def main():
         logger.critical(f"[Fatal] Authentication failed: {e}")
         sys.exit(1)
 
-    while True:
-        qids = bot.fetch_sparql_batch()
-        pending_qids = [q for q in qids if q.upper() not in bot.completed_qids]
+    # Launch Producer and Consumer Threads
+    producer_t = threading.Thread(target=bot.producer_loop, name="ProducerThread", daemon=True)
+    consumer_t = threading.Thread(target=bot.consumer_loop, name="ConsumerThread", daemon=True)
 
-        if not pending_qids:
-            time.sleep(5)
-            continue
+    producer_t.start()
+    consumer_t.start()
 
-        for i in range(0, len(pending_qids), BATCH_FETCH_SIZE):
-            chunk = pending_qids[i : i + BATCH_FETCH_SIZE]
-            entities_batch = bot.fetch_entities_batch(chunk)
-
-            for qid in chunk:
-                entity_data = entities_batch.get(qid, {})
-                try:
-                    bot.process_item_atomic(qid, entity_data)
-                except KeyboardInterrupt:
-                    logger.info("\n[!] Shutdown requested. Exiting cleanly.")
-                    sys.exit(0)
-                except Exception as e:
-                    logger.error(f"QID: {qid} | Error: {e}")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("\n[!] Shutdown requested. Exiting cleanly.")
+        bot.is_running = False
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: wikibot-omnidata-engine
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn render_api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: WIKIDATA_BOT_USER
+        sync: false
+      - key: WIKIDATA_BOT_PASSWORD
+        sync: false
+      - key: WIKIDATA_API_URL
+        value: https://www.wikidata.org/w/api.php
+      - key: USER_AGENT
+        value: ShadowBot/1.0 (contact: User:SHADOWARROW 2026) python-requests/2.34.2
+      - key: INTERNAL_BOT_SECRET
+        value: SHADOW_SECURE_TOKEN_2026

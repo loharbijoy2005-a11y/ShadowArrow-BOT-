@@ -19,6 +19,7 @@ env/
 *.log
 processed_qids.txt
 completed_qids.txt
+skipped_entities.json
 processed_qids.json
 bot_state.sqlite
 
