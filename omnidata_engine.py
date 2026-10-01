@@ -258,9 +258,11 @@ class OmniDataEngine:
     ]
 
     def fetch_candidates_batch(self, offset: int = 0) -> List[str]:
-        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch query rotation."""
+        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch query rotation with random jumps."""
+        import random
         qids = []
-        query = self.SEARCH_QUERIES[(offset // 500) % len(self.SEARCH_QUERIES)]
+        query = random.choice(self.SEARCH_QUERIES)
+        sroffset = random.randint(0, 40000)
         
         try:
             search_params = {
@@ -268,7 +270,7 @@ class OmniDataEngine:
                 "list": "search",
                 "srsearch": query,
                 "srlimit": 500,
-                "sroffset": (offset // len(self.SEARCH_QUERIES)) % 10000,
+                "sroffset": sroffset,
                 "format": "json"
             }
             s_resp = self.session.get(self.config.api_url, params=search_params, timeout=15)
@@ -278,7 +280,7 @@ class OmniDataEngine:
                     title = item.get("title", "")
                     if title.startswith("Q") and title[1:].isdigit() and title not in self.completed_qids:
                         qids.append(title)
-            logger.info(f"CirrusSearch [{query}] returned {len(qids)} fresh candidate QIDs.")
+            logger.info(f"CirrusSearch [{query} | offset={sroffset}] returned {len(qids)} fresh candidate QIDs.")
         except Exception as e:
             logger.error(f"CirrusSearch fetch error: {e}")
 

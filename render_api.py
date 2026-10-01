@@ -46,7 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-Memory State (RAM only - Zero External Database)
+# In-Memory State & Edit History (RAM only - Zero External Database)
 engine_state: Dict[str, Any] = {
     "is_active": False,
     "current_qid": None,
@@ -54,6 +54,7 @@ engine_state: Dict[str, Any] = {
     "last_action_timestamp": None,
     "status_message": "Engine on Standby",
 }
+recent_edits_history: List[Dict[str, Any]] = []
 
 # Global Engine Instance & Lock
 engine_instance: Optional[OmniDataEngine] = None
@@ -144,10 +145,26 @@ def background_wikidata_worker():
 
                 if "success" in res and res["success"] == 1:
                     engine.mark_qid_completed(qid)
+                    ts_now = time.strftime("%Y-%m-%d %H:%M:%S")
+                    edit_record = {
+                        "id": f"edit-{int(time.time() * 1000)}-{qid}",
+                        "qid": qid,
+                        "fieldType": "multi_field",
+                        "fieldLabel": f"Updated QID {qid}",
+                        "newValue": f"Added Hindi/Bengali labels & P18 statements",
+                        "oldValue": "",
+                        "status": "VERIFIED_SAFE",
+                        "timestamp": ts_now,
+                        "latencyMs": 800,
+                        "reverted": False
+                    }
                     with state_lock:
                         engine_state["completed_in_session"] += 1
-                        engine_state["last_action_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        engine_state["last_action_timestamp"] = ts_now
                         engine_state["status_message"] = f"SUCCESS Edit [QID: {qid}]"
+                        recent_edits_history.insert(0, edit_record)
+                        if len(recent_edits_history) > 200:
+                            recent_edits_history.pop()
                     logger.info(f"Render Worker SUCCESS Edit [QID: {qid}]")
                 elif "error" in res and res["error"].get("code") == "badtoken":
                     logger.warning("CSRF token expired. Refreshing...")
@@ -156,9 +173,25 @@ def background_wikidata_worker():
                     resp2 = engine.session.post(engine.config.api_url, data=edit_payload, timeout=15)
                     if resp2.json().get("success") == 1:
                         engine.mark_qid_completed(qid)
+                        ts_now = time.strftime("%Y-%m-%d %H:%M:%S")
+                        edit_record = {
+                            "id": f"edit-{int(time.time() * 1000)}-{qid}",
+                            "qid": qid,
+                            "fieldType": "multi_field",
+                            "fieldLabel": f"Updated QID {qid}",
+                            "newValue": f"Added Hindi/Bengali labels & P18 statements",
+                            "oldValue": "",
+                            "status": "VERIFIED_SAFE",
+                            "timestamp": ts_now,
+                            "latencyMs": 800,
+                            "reverted": False
+                        }
                         with state_lock:
                             engine_state["completed_in_session"] += 1
-                            engine_state["last_action_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            engine_state["last_action_timestamp"] = ts_now
+                            recent_edits_history.insert(0, edit_record)
+                            if len(recent_edits_history) > 200:
+                                recent_edits_history.pop()
                         logger.info(f"Render Worker SUCCESS Edit after refresh [QID: {qid}]")
                     else:
                         engine.log_skipped_entity(qid, f"API Error: {resp2.json()}", payload_data)
@@ -230,33 +263,43 @@ def control_bot(req: ControlRequest, x_bot_token: Optional[str] = Header(None)):
 def get_recent_edits(limit: int = 50, x_bot_token: Optional[str] = Header(None)):
     """Returns recent edit records for Vercel Dashboard feed."""
     verify_token(x_bot_token)
-    edits = []
-    log_file = "omnidata_engine.log"
-    if os.path.exists(log_file):
-        try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                id_counter = 1
-                for line in reversed(lines):
-                    if "SUCCESS Edit [QID:" in line:
-                        parts = line.strip().split("SUCCESS Edit [QID: ")
-                        if len(parts) == 2:
-                            ts = line[:19]
-                            qid = parts[1].split("]")[0]
-                            edits.append({
-                                "id": f"edit-{id_counter}",
-                                "qid": qid,
-                                "fieldType": "multi_field",
-                                "fieldLabel": f"Updated QID {qid}",
-                                "status": "VERIFIED_SAFE",
-                                "timestamp": ts,
-                                "latencyMs": 800
-                            })
-                            id_counter += 1
-                            if len(edits) >= limit:
-                                break
-        except Exception as e:
-            logger.error(f"Error reading log for /edits: {e}")
+    with state_lock:
+        edits = list(recent_edits_history[:limit])
+
+    # Fallback to omnidata_engine.log if in-memory list has fewer items than limit
+    if len(edits) < limit:
+        log_file = "omnidata_engine.log"
+        if os.path.exists(log_file):
+            try:
+                with open(log_file, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    id_counter = 1
+                    existing_qids = set(e["qid"] for e in edits)
+                    for line in reversed(lines):
+                        if "SUCCESS Edit [QID:" in line:
+                            parts = line.strip().split("SUCCESS Edit [QID: ")
+                            if len(parts) == 2:
+                                ts = line[:19]
+                                qid = parts[1].split("]")[0]
+                                if qid not in existing_qids:
+                                    edits.append({
+                                        "id": f"log-edit-{id_counter}",
+                                        "qid": qid,
+                                        "fieldType": "multi_field",
+                                        "fieldLabel": f"Updated QID {qid}",
+                                        "newValue": f"Added Hindi/Bengali labels & P18 statements",
+                                        "oldValue": "",
+                                        "status": "VERIFIED_SAFE",
+                                        "timestamp": ts,
+                                        "latencyMs": 800,
+                                        "reverted": False
+                                    })
+                                    id_counter += 1
+                                    if len(edits) >= limit:
+                                        break
+            except Exception as e:
+                logger.error(f"Error reading log for /edits: {e}")
+
     return {"success": True, "edits": edits, "total": len(edits)}
 
 
