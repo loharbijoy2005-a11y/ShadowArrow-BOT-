@@ -167,19 +167,27 @@ _DESC_PATTERN = re.compile(
 def _parse_en_desc(en_desc: str) -> Optional[Tuple[str, str]]:
     """
     Parses English description to extract (entity_type, state_key).
-    Returns None if description doesn't match the expected pattern.
+    Matches any Indian state/UT name present in the English description.
     """
-    if not en_desc:
+    if not en_desc or not isinstance(en_desc, str):
         return None
-    m = _DESC_PATTERN.match(en_desc.strip())
-    if not m:
+    desc_lo = en_desc.lower()
+
+    # Must be a settlement, village, town, city, panchayat, tehsil, mouza, or district location
+    settlement_keywords = [
+        "village", "settlement", "town", "city", "panchayat", "tehsil",
+        "block", "mouza", "locality", "district", "subdivision", "taluk", "taluka"
+    ]
+    if not any(kw in desc_lo for kw in settlement_keywords):
         return None
-    raw_type  = m.group(1).lower()
-    raw_state = m.group(2).strip()
-    etype = "village" if ("village" in raw_type or "settlement" in raw_type) else "city"
-    for key in _STATES:
-        if key.lower() in raw_state.lower():
-            return (etype, key)
+
+    etype = "village" if any(kw in desc_lo for kw in ["village", "settlement", "mouza", "panchayat"]) else "city"
+
+    # Match state from _STATES dictionary directly from description string
+    for state_name in _STATES:
+        if state_name.lower() in desc_lo:
+            return (etype, state_name)
+
     return None
 
 

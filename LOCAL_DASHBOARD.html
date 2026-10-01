@@ -317,8 +317,15 @@
       }
 
       // Metrics
-      document.getElementById('m-edits').textContent   = d.completed_in_session || 0;
-      document.getElementById('m-epm-pill').textContent = epm > 0 ? epm + ' EPM' : 'Idle';
+      document.getElementById('m-edits').textContent = d.completed_in_session || 0;
+      const epmPill = document.getElementById('m-epm-pill');
+      if (isActive) {
+        epmPill.className   = 'pill pill-green';
+        epmPill.textContent = epm > 0 ? epm + ' EPM' : '⚡ Active (60 EPM Max)';
+      } else {
+        epmPill.className   = 'pill pill-rose';
+        epmPill.textContent = '⏸ Paused';
+      }
       document.getElementById('m-queue').textContent   = q;
       document.getElementById('m-errors').textContent  = d.errors_in_session   || 0;
       document.getElementById('m-skipped').textContent = d.skipped_in_session  || 0;
