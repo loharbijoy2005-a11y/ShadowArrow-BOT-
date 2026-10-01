@@ -20,7 +20,7 @@ export interface EditRecord {
 
 export async function GET() {
   try {
-    const res = await fetch(`${RENDER_BACKEND_URL}/edits?limit=25`, {
+    const res = await fetch(`${RENDER_BACKEND_URL}/edits?limit=500`, {
       headers: {
         'X-Bot-Token': BOT_SECRET
       },
@@ -47,8 +47,8 @@ export async function GET() {
 
         return NextResponse.json({
           success: true,
-          edits: formattedEdits.slice(0, 25),
-          total: formattedEdits.slice(0, 25).length
+          edits: formattedEdits.slice(0, 500),
+          total: formattedEdits.slice(0, 500).length
         });
       }
     }
