@@ -93,59 +93,50 @@ export default function Header({ botStatus, requestDelay, onStatusChange, onDela
         <div className="flex flex-wrap items-center gap-3">
           
           {/* Status Badge */}
-          <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-slate-950/80 border border-slate-800">
-            <span className="text-xs text-slate-400 font-medium">Status:</span>
-            <div className="flex items-center space-x-1.5">
-              <span className={`w-2.5 h-2.5 rounded-full ${
-                botStatus === 'RUNNING' ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)] animate-pulse' :
-                botStatus === 'RATE_LIMITED' ? 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.8)]' :
-                'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.8)]'
+          <div className="flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-slate-950/90 border border-slate-800 shadow-md">
+            <span className="text-xs text-slate-400 font-medium">Bot State:</span>
+            <div className="flex items-center space-x-2">
+              <span className={`w-3 h-3 rounded-full ${
+                botStatus === 'RUNNING' ? 'bg-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.9)] animate-pulse' :
+                botStatus === 'RATE_LIMITED' ? 'bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.9)]' :
+                'bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.9)]'
               }`} />
-              <span className={`text-xs font-bold tracking-wide ${
+              <span className={`text-xs font-extrabold uppercase tracking-wider ${
                 botStatus === 'RUNNING' ? 'text-emerald-400' :
                 botStatus === 'RATE_LIMITED' ? 'text-amber-400' :
                 'text-rose-400'
               }`}>
-                {botStatus}
+                {botStatus === 'RUNNING' ? 'ONLINE (ACTIVE)' : 'OFFLINE (PAUSED)'}
               </span>
             </div>
           </div>
 
-          {/* Request Delay Slider */}
-          <div className="hidden sm:flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-slate-950/80 border border-slate-800">
-            <Sliders className="w-3.5 h-3.5 text-slate-400" />
-            <span className="text-xs text-slate-400 font-medium">Delay:</span>
-            <input
-              type="range"
-              min="1.5"
-              max="5.0"
-              step="0.1"
-              value={requestDelay}
-              onChange={handleDelaySlider}
-              className="w-20 accent-indigo-500 cursor-pointer"
-            />
-            <span className="text-xs font-mono font-semibold text-slate-200">{requestDelay}s</span>
+          {/* Request Delay Indicator */}
+          <div className="hidden sm:flex items-center space-x-2 px-3 py-2 rounded-xl bg-slate-950/80 border border-slate-800">
+            <Zap className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="text-xs text-slate-400 font-medium">Safe Delay:</span>
+            <span className="text-xs font-mono font-bold text-indigo-300">0.8s Rate-Limit</span>
           </div>
 
-          {/* Pause / Resume Button */}
+          {/* Main 1-Click BOT ON / OFF Button */}
           <button
             onClick={toggleStatus}
             disabled={loading}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all shadow-sm ${
+            className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-md active:scale-95 ${
               botStatus === 'RUNNING'
-                ? 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                : 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                ? 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/40 shadow-rose-500/10'
+                : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/40 shadow-emerald-500/10'
             }`}
           >
             {botStatus === 'RUNNING' ? (
               <>
-                <Pause className="w-3.5 h-3.5" />
-                <span>Pause Bot</span>
+                <Pause className="w-4 h-4 text-rose-400" />
+                <span>TURN BOT OFF</span>
               </>
             ) : (
               <>
-                <Play className="w-3.5 h-3.5" />
-                <span>Resume Bot</span>
+                <Play className="w-4 h-4 text-emerald-400 animate-bounce" />
+                <span>TURN BOT ON</span>
               </>
             )}
           </button>
@@ -154,7 +145,7 @@ export default function Header({ botStatus, requestDelay, onStatusChange, onDela
           <button
             onClick={handleKillSwitch}
             disabled={loading}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 transition-all shadow-sm shadow-rose-500/10"
+            className="flex items-center space-x-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-slate-950 hover:bg-rose-950/50 text-slate-400 hover:text-rose-300 border border-slate-800 hover:border-rose-500/40 transition-all"
           >
             <AlertOctagon className="w-3.5 h-3.5 text-rose-400" />
             <span>Emergency Kill</span>
