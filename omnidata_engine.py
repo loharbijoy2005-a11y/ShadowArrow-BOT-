@@ -1,14 +1,14 @@
 """
-OmniData Engine: Production-Grade Fault-Tolerant Wikidata Bot
-Architected for Zero Rate-Limit Blocks and Zero Data Corruption Risks.
+OmniData Engine v3 — ULTRA-SPEED Production Bot
+Architecture: 5 Consumer Threads × ~1 edit/sec each ≈ 300+ edits/minute
 
-Key Capabilities:
-1. Multi-Source Data Enrichment (SPARQL + MediaWiki API + Wikimedia Commons API for P18).
-2. Sitelink-Based Native Labels (hiwiki / bnwiki strictly, no transliteration/guessing).
-3. Pattern-based Structured Localized Descriptions (Hindi & Bengali).
-4. Producer-Consumer Threading Model (threading + queue.Queue).
-5. Hard Regex Guardrails for Script Purity (Zero Latin, No Cross-Script Contamination).
-6. State Tracking & skipped_entities.json logging.
+Speed Upgrades v3:
+  - 5 Parallel Consumer Writer Threads (was 1)
+  - 8 Parallel CirrusSearch Fetch Workers
+  - 50-Thread Producer Payload Prep Pool
+  - 1000-item Queue Buffer (zero consumer starvation)
+  - Ratelimit detection with automatic re-queue
+  - Real-time EPM (edits-per-minute) telemetry in every log line
 """
 
 import os
@@ -16,15 +16,26 @@ import re
 import json
 import time
 import queue
+import random
 import logging
 import threading
 import unicodedata
 from typing import Dict, List, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config import Config
+
+# ─── Speed Config ──────────────────────────────────────────────────────────────
+NUM_CONSUMER_THREADS     = 5    # Parallel writer threads → 5× throughput
+PRODUCER_POOL_SIZE       = 50   # ThreadPoolExecutor for payload prep
+FETCH_WORKERS            = 8    # Parallel CirrusSearch fetch workers
+QUEUE_MAX                = 1000 # Max buffered payloads in RAM
+ENTITY_BATCH_SIZE        = 50   # Wikidata API max per wbgetentities call
+RATE_LIMIT_PER_CONSUMER  = 1.0  # Seconds per edit per consumer
 
 # Configure Logging
 logging.basicConfig(
@@ -144,12 +155,12 @@ class OmniDataEngine:
         self.state_file = state_file
         self.skipped_file = skipped_file
 
-        # Session with HTTPAdapter connection pool
+        # Shared HTTP session — large pool for parallel consumers + producers
         self.session = requests.Session()
         adapter = HTTPAdapter(
-            pool_connections=50,
-            pool_maxsize=100,
-            max_retries=Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+            pool_connections=100,
+            pool_maxsize=200,
+            max_retries=Retry(total=3, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504])
         )
         self.session.mount("https://", adapter)
         self.session.headers.update({
@@ -158,15 +169,19 @@ class OmniDataEngine:
         })
 
         self.csrf_token: Optional[str] = None
-        self.auth_lock = threading.RLock()
+        self.auth_lock = threading.RLock()   # Guards token refresh across threads
         self.is_logged_in = False
 
-        # Queue & State (Max 300 candidates pre-fetched in RAM)
-        self.task_queue: queue.Queue = queue.Queue(maxsize=300)
+        # Large buffer — 1000 items so 5 consumers never starve
+        self.task_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
         self.completed_qids = self._load_completed_qids()
         self.skipped_entities: List[Dict[str, Any]] = []
-
         self.producer_finished = False
+
+        # Speed telemetry
+        self.edits_this_session = 0
+        self.session_start_ts   = time.time()
+        self._speed_lock        = threading.Lock()
 
     def _load_completed_qids(self) -> set:
         if os.path.exists(self.state_file):
@@ -178,6 +193,13 @@ class OmniDataEngine:
         with open(self.state_file, "a", encoding="utf-8") as f:
             f.write(f"{qid}\n")
         self.completed_qids.add(qid)
+        with self._speed_lock:
+            self.edits_this_session += 1
+
+    def edits_per_minute(self) -> float:
+        elapsed = max(1, time.time() - self.session_start_ts)
+        with self._speed_lock:
+            return round(self.edits_this_session / elapsed * 60, 1)
 
     def log_skipped_entity(self, qid: str, reason: str, payload: Dict[str, Any]):
         entry = {
@@ -393,40 +415,39 @@ class OmniDataEngine:
         return payload_data
 
     SEARCH_QUERIES = [
-        "haswbstatement:P31=Q532 haswbstatement:P17=Q668",      # Villages in India
-        "haswbstatement:P31=Q486914 haswbstatement:P17=Q668",   # Settlements in India
-        "haswbstatement:P31=Q11776861 haswbstatement:P17=Q668", # Tehsils/Subdistricts in India
-        "haswbstatement:P31=Q1549592 haswbstatement:P17=Q668",  # Districts in India
-        "haswbstatement:P17=Q668"                               # All Indian entities
+        "haswbstatement:P31=Q532 haswbstatement:P17=Q668",       # Villages in India
+        "haswbstatement:P31=Q486914 haswbstatement:P17=Q668",    # Human settlements
+        "haswbstatement:P31=Q11776861 haswbstatement:P17=Q668",  # Tehsils/Subdistricts
+        "haswbstatement:P31=Q1549592 haswbstatement:P17=Q668",   # Big cities
+        "haswbstatement:P17=Q668 -haswbstatement:description[hi]",  # Missing Hindi desc
+        "haswbstatement:P17=Q668 -haswbstatement:label[hi]",        # Missing Hindi label
+        "haswbstatement:P17=Q668 -haswbstatement:label[bn]",        # Missing Bengali label
+        "haswbstatement:P17=Q668",                                  # All Indian entities
     ]
 
     def fetch_candidates_batch(self, offset: int = 0) -> List[str]:
-        """Fetches fresh batch of candidate QIDs via MediaWiki CirrusSearch query rotation with safe random offsets."""
-        import random
+        """Single CirrusSearch call — called 8× in parallel by producer."""
         qids = []
         query = random.choice(self.SEARCH_QUERIES)
-        sroffset = random.randint(0, 18) * 500  # Safe offset between 0 and 9000
-        
+        sroffset = random.randint(0, 18) * 500   # 0–9000, safe range
         try:
-            search_params = {
-                "action": "query",
-                "list": "search",
-                "srsearch": query,
-                "srlimit": 500,
-                "sroffset": sroffset,
-                "format": "json"
-            }
-            s_resp = self.session.get(self.config.api_url, params=search_params, timeout=15)
-            if s_resp.status_code == 200:
-                s_res = s_resp.json().get("query", {}).get("search", [])
-                for item in s_res:
-                    title = item.get("title", "")
-                    if title.startswith("Q") and title[1:].isdigit() and title not in self.completed_qids:
-                        qids.append(title)
-            logger.info(f"CirrusSearch [{query} | offset={sroffset}] returned {len(qids)} fresh candidate QIDs.")
+            resp = self.session.get(
+                self.config.api_url,
+                params={
+                    "action": "query", "list": "search",
+                    "srsearch": query, "srlimit": 500,
+                    "sroffset": sroffset, "format": "json"
+                },
+                timeout=15
+            )
+            if resp.status_code == 200:
+                for item in resp.json().get("query", {}).get("search", []):
+                    t = item.get("title", "")
+                    if t.startswith("Q") and t[1:].isdigit() and t not in self.completed_qids:
+                        qids.append(t)
+            logger.info(f"Fetch [{query[:35]}|off={sroffset}] → {len(qids)} QIDs")
         except Exception as e:
             logger.error(f"CirrusSearch fetch error: {e}")
-
         return qids
 
     def fetch_entities_batch(self, qids: List[str]) -> Dict[str, Any]:
@@ -454,145 +475,193 @@ class OmniDataEngine:
         return self.fetch_candidates_batch(offset=0)
 
     def producer_loop(self):
-        """Thread A: Infinite worker that pre-fetches and queues valid edit payloads with 25-thread pool."""
-        from concurrent.futures import ThreadPoolExecutor
-        logger.info("Producer infinite worker thread started (25-Thread Mode).")
-        offset = 0
+        """
+        ULTRA-SPEED Producer: 8 parallel CirrusSearch fetches + 50-thread payload prep.
+        Keeps 1000-item queue full so 5 consumers never wait.
+        """
+        logger.info(f"ULTRA-SPEED Producer: {FETCH_WORKERS} fetch workers + {PRODUCER_POOL_SIZE}-thread payload pool.")
 
-        with ThreadPoolExecutor(max_workers=25) as executor:
-            while True:
-                # Buffer queue up to 250 candidates
-                if self.task_queue.qsize() > 200:
-                    time.sleep(1.0)
-                    continue
+        with ThreadPoolExecutor(max_workers=PRODUCER_POOL_SIZE) as payload_pool:
+            fetch_pool = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
+            try:
+                while True:
+                    # Backpressure: don't overfill
+                    if self.task_queue.qsize() > QUEUE_MAX * 0.8:
+                        time.sleep(0.3)
+                        continue
 
-                qids = self.fetch_candidates_batch(offset=offset)
-                offset += 500
-                if offset >= 50000:
-                    offset = 0  # Wrap around
+                    # Launch 8 parallel CirrusSearch fetches
+                    fetch_futures = [
+                        fetch_pool.submit(self.fetch_candidates_batch, i * 500)
+                        for i in range(FETCH_WORKERS)
+                    ]
 
-                if not qids:
-                    logger.info("No candidates returned in chunk. Retrying next query offset...")
-                    time.sleep(1.0)
-                    continue
-
-                batch_size = 50
-                added_count = 0
-
-                for i in range(0, len(qids), batch_size):
-                    chunk = qids[i:i + batch_size]
-                    entities = self.fetch_entities_batch(chunk)
-
-                    futures = []
-                    for qid in chunk:
-                        entity = entities.get(qid, {})
-                        if not entity:
-                            futures.append((qid, None))
-                            continue
-                        futures.append((qid, executor.submit(self.prepare_payload, qid, entity)))
-
-                    for qid, fut in futures:
-                        if fut is None:
-                            continue
+                    all_qids: List[str] = []
+                    for fut in as_completed(fetch_futures):
                         try:
-                            payload_data = fut.result()
-                            if payload_data:
-                                self.task_queue.put((qid, payload_data))
-                                added_count += 1
+                            all_qids.extend(fut.result())
                         except Exception as e:
-                            logger.error(f"Error preparing payload for {qid}: {e}")
+                            logger.error(f"Fetch worker error: {e}")
 
-                logger.info(f"Producer batch complete: Queued {added_count} payloads. Total Queue Size: {self.task_queue.qsize()}")
+                    # Deduplicate freshly fetched QIDs
+                    seen: set = set()
+                    unique_qids = []
+                    for q in all_qids:
+                        if q not in seen and q not in self.completed_qids:
+                            seen.add(q)
+                            unique_qids.append(q)
+
+                    if not unique_qids:
+                        logger.info("No fresh QIDs this round. Retrying...")
+                        time.sleep(0.3)
+                        continue
+
+                    logger.info(f"Producer: {len(unique_qids)} unique QIDs. Fetching entities in parallel...")
+
+                    # Fetch entity data in parallel chunks of 50
+                    entity_futures = [
+                        fetch_pool.submit(self.fetch_entities_batch, unique_qids[i:i + ENTITY_BATCH_SIZE])
+                        for i in range(0, len(unique_qids), ENTITY_BATCH_SIZE)
+                    ]
+                    all_entities: Dict[str, Any] = {}
+                    for fut in as_completed(entity_futures):
+                        try:
+                            all_entities.update(fut.result())
+                        except Exception as e:
+                            logger.error(f"Entity fetch error: {e}")
+
+                    # Prepare payloads in parallel (50-thread pool)
+                    prep_futures = {}
+                    for qid in unique_qids:
+                        entity = all_entities.get(qid, {})
+                        if not entity:
+                            continue
+                        fut = payload_pool.submit(self.prepare_payload, qid, entity)
+                        prep_futures[fut] = qid
+
+                    added = 0
+                    for fut in as_completed(prep_futures):
+                        qid = prep_futures[fut]
+                        try:
+                            payload = fut.result()
+                            if payload:
+                                self.task_queue.put((qid, payload))
+                                added += 1
+                        except Exception as e:
+                            logger.error(f"Payload prep error [{qid}]: {e}")
+
+                    logger.info(f"Producer queued {added} payloads. Q={self.task_queue.qsize()} EPM={self.edits_per_minute()}")
+            finally:
+                fetch_pool.shutdown(wait=False)
 
         logger.info("Producer thread exiting.")
 
-    def consumer_loop(self):
-        """Thread B: Writer that executes wbeditentity at maximum safe 0.8s cycle speed."""
-        logger.info("Consumer writer thread started.")
+    def _consumer_worker(self, thread_id: int):
+        """
+        One consumer thread. Pulls from shared queue and writes to Wikidata.
+        5 threads × 1 edit/sec = 5 edits/sec = 300 edits/min target.
+        """
+        logger.info(f"Consumer-{thread_id} writer thread started.")
 
         while True:
             t_start = time.time()
             try:
-                qid, payload_data = self.task_queue.get(timeout=2.0)
+                qid, payload_data = self.task_queue.get(timeout=3.0)
             except queue.Empty:
                 if self.producer_finished:
-                    logger.info("Consumer finished all queued items.")
+                    logger.info(f"Consumer-{thread_id} finished.")
                     break
                 continue
 
-            # Validate guardrails before editing
+            # Script guardrails
             guard_ok = True
             for lang, lbl_obj in payload_data.get("labels", {}).items():
                 if not validate_script(lbl_obj["value"], lang):
                     self.log_skipped_entity(qid, f"Label script guardrail mismatch: {lang}", payload_data)
                     guard_ok = False
                     break
-
-            for lang, desc_obj in payload_data.get("descriptions", {}).items():
-                if not validate_script(desc_obj["value"], lang):
-                    self.log_skipped_entity(qid, f"Description script guardrail mismatch: {lang}", payload_data)
-                    guard_ok = False
-                    break
+            if guard_ok:
+                for lang, desc_obj in payload_data.get("descriptions", {}).items():
+                    if not validate_script(desc_obj["value"], lang):
+                        self.log_skipped_entity(qid, f"Desc guardrail mismatch: {lang}", payload_data)
+                        guard_ok = False
+                        break
 
             if not guard_ok:
                 self.task_queue.task_done()
                 continue
 
-            # Execute wbeditentity edit
+            edit_payload = {
+                "action": "wbeditentity",
+                "id": qid,
+                "data": json.dumps(payload_data, ensure_ascii=False),
+                "token": self.csrf_token,
+                "summary": "Added missing Bengali and Hindi labels, descriptions, and P18 media statements",
+                "bot": 1,
+                "format": "json"
+            }
+
             try:
-                edit_payload = {
-                    "action": "wbeditentity",
-                    "id": qid,
-                    "data": json.dumps(payload_data, ensure_ascii=False),
-                    "token": self.csrf_token,
-                    "summary": "Added missing Bengali and Hindi labels, descriptions, and P18 media statements",
-                    "bot": 1,
-                    "format": "json"
-                }
-
                 resp = self.session.post(self.config.api_url, data=edit_payload, timeout=15)
-                res = resp.json()
+                res  = resp.json()
 
-                if "success" in res and res["success"] == 1:
+                if res.get("success") == 1:
                     self.mark_qid_completed(qid)
-                    logger.info(f"SUCCESS Edit [QID: {qid}] - {list(payload_data.keys())}")
-                elif "error" in res and res["error"].get("code") == "badtoken":
-                    logger.warning("CSRF token expired. Refreshing token and retrying...")
+                    logger.info(f"[C{thread_id}] SUCCESS [{qid}] EPM={self.edits_per_minute()} Q={self.task_queue.qsize()}")
+
+                elif res.get("error", {}).get("code") == "badtoken":
+                    logger.warning(f"[C{thread_id}] CSRF expired. Refreshing...")
                     self.fetch_csrf_token()
                     edit_payload["token"] = self.csrf_token
                     resp2 = self.session.post(self.config.api_url, data=edit_payload, timeout=15)
                     if resp2.json().get("success") == 1:
                         self.mark_qid_completed(qid)
-                        logger.info(f"SUCCESS Edit after token refresh [QID: {qid}]")
+                        logger.info(f"[C{thread_id}] SUCCESS (token refresh) [{qid}]")
                     else:
                         self.log_skipped_entity(qid, f"API Error: {resp2.json()}", payload_data)
+
+                elif res.get("error", {}).get("code") == "ratelimited":
+                    logger.warning(f"[C{thread_id}] Rate-limited! Backing off 5s, re-queuing {qid}...")
+                    time.sleep(5)
+                    self.task_queue.put((qid, payload_data))  # Re-queue, don't lose it
+
                 else:
                     self.log_skipped_entity(qid, f"API Error: {res}", payload_data)
 
             except Exception as e:
-                logger.error(f"Exception during edit of {qid}: {e}")
+                logger.error(f"[C{thread_id}] Exception editing {qid}: {e}")
                 self.log_skipped_entity(qid, f"Exception: {str(e)}", payload_data)
 
             self.task_queue.task_done()
-            # Dynamic sleep to guarantee exact 0.8s rate limit cycle
+
+            # Per-thread rate limit
             elapsed = time.time() - t_start
-            sleep_needed = max(0.0, 0.8 - elapsed)
-            time.sleep(sleep_needed)
+            sleep_needed = max(0.0, RATE_LIMIT_PER_CONSUMER - elapsed)
+            if sleep_needed > 0:
+                time.sleep(sleep_needed)
+
+    # Keep old name as alias for render_api.py compatibility
+    def consumer_loop(self):
+        self._consumer_worker(0)
 
     def run(self):
-        """Starts Producer-Consumer pipeline."""
+        """Starts Producer + 5× Consumer threads."""
         if not self.login():
             logger.error("Authentication failed. Aborting OmniData Engine.")
             return
 
-        producer_thread = threading.Thread(target=self.producer_loop, name="ProducerWorker")
-        consumer_thread = threading.Thread(target=self.consumer_loop, name="ConsumerWriter")
-
+        producer_thread = threading.Thread(target=self.producer_loop, name="ProducerWorker", daemon=True)
         producer_thread.start()
-        consumer_thread.start()
+
+        consumer_threads = []
+        for i in range(NUM_CONSUMER_THREADS):
+            t = threading.Thread(target=self._consumer_worker, args=(i,), name=f"Consumer-{i}")
+            t.start()
+            consumer_threads.append(t)
 
         producer_thread.join()
-        consumer_thread.join()
+        for t in consumer_threads:
+            t.join()
 
         logger.info("OmniData Engine execution complete.")
 

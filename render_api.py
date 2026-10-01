@@ -51,8 +51,10 @@ engine_state: Dict[str, Any] = {
     "is_active": False,
     "current_qid": None,
     "completed_in_session": 0,
+    "edits_per_minute": 0.0,
     "last_action_timestamp": None,
     "status_message": "Engine on Standby",
+    "queue_size": 0,
 }
 recent_edits_history: List[Dict[str, Any]] = []
 
@@ -74,12 +76,12 @@ class ControlRequest(BaseModel):
 def background_wikidata_worker():
     """
     Background Thread Worker:
-    Controls the OmniDataEngine producer-consumer loop with 0.8s rate limiting.
+    Spawns 5 parallel consumer threads for maximum write throughput.
     Keeps state strictly in-memory (RAM).
     """
     global engine_instance
 
-    logger.info("Initializing OmniDataEngine in Render background worker...")
+    logger.info("Initializing OmniDataEngine in Render background worker (5-consumer mode)...")
     cfg = Config.from_env()
     cfg.validate(require_auth=True)
 
@@ -95,57 +97,68 @@ def background_wikidata_worker():
 
     logger.info("Render background worker successfully authenticated with Wikidata.")
 
-    # Background candidate pre-fetcher thread (Infinite Producer)
+    # Infinite Producer Thread (8 parallel CirrusSearch fetch workers)
     producer_thread = threading.Thread(target=engine.producer_loop, name="RenderProducer", daemon=True)
     producer_thread.start()
 
-    # Main writer loop
-    while True:
-        if engine_state["is_active"]:
+    # 5 Consumer Writer Threads
+    def render_consumer(thread_id: int):
+        """Render-aware consumer: same as engine consumer but also updates engine_state."""
+        while True:
+            if not engine_state["is_active"]:
+                with state_lock:
+                    engine_state["current_qid"] = None
+                    engine_state["status_message"] = "Paused by admin dashboard"
+                    engine_state["queue_size"] = engine.task_queue.qsize()
+                time.sleep(1.0)
+                continue
+
             t_start = time.time()
             try:
                 qid, payload_data = engine.task_queue.get(timeout=2.0)
+            except Exception:
+                continue
 
-                # Script Guardrails Check
-                guard_ok = True
-                for lang, lbl_obj in payload_data.get("labels", {}).items():
-                    if not validate_script(lbl_obj["value"], lang):
-                        engine.log_skipped_entity(qid, f"Label script guardrail mismatch: {lang}", payload_data)
-                        guard_ok = False
-                        break
-
+            # Script guardrails
+            guard_ok = True
+            for lang, lbl_obj in payload_data.get("labels", {}).items():
+                if not validate_script(lbl_obj["value"], lang):
+                    engine.log_skipped_entity(qid, f"Label guardrail: {lang}", payload_data)
+                    guard_ok = False
+                    break
+            if guard_ok:
                 for lang, desc_obj in payload_data.get("descriptions", {}).items():
                     if not validate_script(desc_obj["value"], lang):
-                        engine.log_skipped_entity(qid, f"Description script guardrail mismatch: {lang}", payload_data)
+                        engine.log_skipped_entity(qid, f"Desc guardrail: {lang}", payload_data)
                         guard_ok = False
                         break
 
-                if not guard_ok:
-                    engine.task_queue.task_done()
-                    continue
+            if not guard_ok:
+                engine.task_queue.task_done()
+                continue
 
-                # Update active state
-                with state_lock:
-                    engine_state["current_qid"] = qid
-                    engine_state["status_message"] = f"Processing Wikidata entity {qid}"
+            with state_lock:
+                engine_state["current_qid"] = qid
+                engine_state["status_message"] = f"[C{thread_id}] Processing {qid}"
 
-                # Send wbeditentity POST request
-                edit_payload = {
-                    "action": "wbeditentity",
-                    "id": qid,
-                    "data": json.dumps(payload_data, ensure_ascii=False),
-                    "token": engine.csrf_token,
-                    "summary": "Added missing Bengali and Hindi labels, descriptions, and P18 media statements",
-                    "bot": 1,
-                    "format": "json"
-                }
+            edit_payload = {
+                "action": "wbeditentity",
+                "id": qid,
+                "data": json.dumps(payload_data, ensure_ascii=False),
+                "token": engine.csrf_token,
+                "summary": "Added missing Bengali and Hindi labels, descriptions, and P18 media statements",
+                "bot": 1,
+                "format": "json"
+            }
 
+            try:
                 resp = engine.session.post(engine.config.api_url, data=edit_payload, timeout=15)
-                res = resp.json()
+                res  = resp.json()
 
-                if "success" in res and res["success"] == 1:
+                if res.get("success") == 1:
                     engine.mark_qid_completed(qid)
                     ts_now = time.strftime("%Y-%m-%d %H:%M:%S")
+                    epm    = engine.edits_per_minute()
                     edit_record = {
                         "id": f"edit-{int(time.time() * 1000)}-{qid}",
                         "qid": qid,
@@ -155,65 +168,68 @@ def background_wikidata_worker():
                         "oldValue": "",
                         "status": "VERIFIED_SAFE",
                         "timestamp": ts_now,
-                        "latencyMs": 800,
+                        "latencyMs": int((time.time() - t_start) * 1000),
                         "reverted": False
                     }
                     with state_lock:
                         engine_state["completed_in_session"] += 1
+                        engine_state["edits_per_minute"]      = epm
                         engine_state["last_action_timestamp"] = ts_now
-                        engine_state["status_message"] = f"SUCCESS Edit [QID: {qid}]"
+                        engine_state["status_message"]        = f"[C{thread_id}] SUCCESS {qid} | EPM={epm}"
+                        engine_state["queue_size"]            = engine.task_queue.qsize()
                         recent_edits_history.insert(0, edit_record)
-                        if len(recent_edits_history) > 200:
+                        if len(recent_edits_history) > 500:
                             recent_edits_history.pop()
-                    logger.info(f"Render Worker SUCCESS Edit [QID: {qid}]")
-                elif "error" in res and res["error"].get("code") == "badtoken":
-                    logger.warning("CSRF token expired. Refreshing...")
+                    logger.info(f"[C{thread_id}] SUCCESS [{qid}] EPM={epm}")
+
+                elif res.get("error", {}).get("code") == "badtoken":
+                    logger.warning(f"[C{thread_id}] CSRF expired. Refreshing...")
                     engine.fetch_csrf_token()
                     edit_payload["token"] = engine.csrf_token
                     resp2 = engine.session.post(engine.config.api_url, data=edit_payload, timeout=15)
                     if resp2.json().get("success") == 1:
                         engine.mark_qid_completed(qid)
                         ts_now = time.strftime("%Y-%m-%d %H:%M:%S")
-                        edit_record = {
-                            "id": f"edit-{int(time.time() * 1000)}-{qid}",
-                            "qid": qid,
-                            "fieldType": "multi_field",
-                            "fieldLabel": f"Updated QID {qid}",
-                            "newValue": f"Added Hindi/Bengali labels & P18 statements",
-                            "oldValue": "",
-                            "status": "VERIFIED_SAFE",
-                            "timestamp": ts_now,
-                            "latencyMs": 800,
-                            "reverted": False
-                        }
                         with state_lock:
                             engine_state["completed_in_session"] += 1
+                            engine_state["edits_per_minute"]      = engine.edits_per_minute()
                             engine_state["last_action_timestamp"] = ts_now
-                            recent_edits_history.insert(0, edit_record)
-                            if len(recent_edits_history) > 200:
-                                recent_edits_history.pop()
-                        logger.info(f"Render Worker SUCCESS Edit after refresh [QID: {qid}]")
+                            recent_edits_history.insert(0, {
+                                "id": f"edit-{int(time.time() * 1000)}-{qid}",
+                                "qid": qid, "fieldType": "multi_field",
+                                "fieldLabel": f"Updated QID {qid}",
+                                "newValue": "Added Hindi/Bengali labels & P18 statements",
+                                "oldValue": "", "status": "VERIFIED_SAFE",
+                                "timestamp": ts_now,
+                                "latencyMs": int((time.time() - t_start) * 1000),
+                                "reverted": False
+                            })
                     else:
                         engine.log_skipped_entity(qid, f"API Error: {resp2.json()}", payload_data)
+
+                elif res.get("error", {}).get("code") == "ratelimited":
+                    logger.warning(f"[C{thread_id}] Rate-limited! Backing off 5s, re-queuing...")
+                    time.sleep(5)
+                    engine.task_queue.put((qid, payload_data))
+
                 else:
                     engine.log_skipped_entity(qid, f"API Error: {res}", payload_data)
 
-                engine.task_queue.task_done()
-
-            except queue.Empty:
-                pass
             except Exception as e:
-                logger.error(f"Worker exception: {e}")
+                logger.error(f"[C{thread_id}] Worker exception: {e}")
 
-            # Dynamic sleep calculation for exact 0.8s rate-limit interval
+            engine.task_queue.task_done()
+
+            # 1.0s per consumer — 5 consumers = ~300 edits/min
             elapsed = time.time() - t_start
-            sleep_needed = max(0.0, 0.8 - elapsed)
-            time.sleep(sleep_needed)
-        else:
-            with state_lock:
-                engine_state["current_qid"] = None
-                engine_state["status_message"] = "Paused by admin dashboard"
-            time.sleep(1.0)
+            sleep_needed = max(0.0, 1.0 - elapsed)
+            if sleep_needed > 0:
+                time.sleep(sleep_needed)
+
+    for i in range(5):
+        ct = threading.Thread(target=render_consumer, args=(i,), name=f"RenderConsumer-{i}", daemon=True)
+        ct.start()
+        logger.info(f"RenderConsumer-{i} started.")
 
 
 # Start daemon worker thread on boot
