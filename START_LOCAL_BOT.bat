@@ -5,47 +5,70 @@ chcp 65001 >nul
 
 echo.
 echo  ============================================================
-echo   WikiBot v3 - LOCAL HIGH-SPEED MODE
-echo   5 threads x 1s = up to 300 edits/min
+echo   WikiBot v3 - LOCAL AUTOMATION ENGINE
+echo   Auto-Pauses Render Cloud and Runs Local Engine
 echo  ============================================================
 echo.
 
 cd /d "%~dp0"
 
-REM ── Step 1: Find Python ──────────────────────────────────────
-echo  [1/3] Checking Python...
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo  [ERROR] Python not found! Install Python from python.org
-    pause
-    exit /b 1
-)
-echo  [OK] Python found.
+REM ── Step 1: Detect Python & Virtual Environment ───────────────
+echo  [1/3] Detecting Python environment...
 
-REM ── Step 2: Install missing packages ─────────────────────────
-echo  [2/3] Installing required packages (fastapi, uvicorn, etc.)...
-python -m pip install fastapi uvicorn pydantic requests python-dotenv urllib3 --quiet --disable-pip-version-check
-if errorlevel 1 (
-    echo  [WARN] pip install had issues, trying to continue anyway...
-)
-echo  [OK] Packages ready.
+set "PYTHON_EXE=python"
 
-REM ── Step 3: Start the bot ─────────────────────────────────────
-echo  [3/3] Starting WikiBot v3...
+if exist "%~dp0.venv\Scripts\python.exe" (
+    set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
+    echo  [OK] Using virtualenv Python: "%~dp0.venv\Scripts\python.exe"
+) else (
+    python --version >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo  [ERROR] Python is not installed or not in PATH!
+        echo  Please install Python 3.10+ from https://www.python.org
+        echo.
+        pause
+        exit /b 1
+    )
+    echo  [OK] Using system Python.
+)
+
+REM ── Step 2: Ensure Required Packages ─────────────────────────
+echo  [2/3] Checking required Python packages...
+"%PYTHON_EXE%" -m pip install fastapi uvicorn pydantic requests python-dotenv urllib3 --quiet --disable-pip-version-check
+if errorlevel 1 (
+    echo  [WARN] Pip install returned warnings/errors. Attempting to start bot anyway...
+)
+echo  [OK] Dependencies verified.
+
+REM ── Step 3: Start Local Bot Engine ───────────────────────────
+echo  [3/3] Starting WikiBot Local Engine...
 echo.
 echo  ============================================================
-echo  LOCAL DASHBOARD: Open  LOCAL_DASHBOARD.html  in browser
-echo  OR visit:        http://localhost:8000
-echo  Close this window to STOP the bot.
+echo   LOCAL DASHBOARD: Double click LOCAL_DASHBOARD.html
+echo   OR visit:        http://localhost:8000
+echo   Render Cloud:    Auto-Paused while local runs
+echo   To Stop:         Close this window OR run STOP_LOCAL_BOT.bat
 echo  ============================================================
 echo.
 
-REM Open local dashboard in browser after 3 seconds
-timeout /t 3 /nobreak >nul
+REM Open local dashboard in default browser after 2 seconds
+timeout /t 2 /nobreak >nul
 start "" "%~dp0LOCAL_DASHBOARD.html"
 
-python main.py
+REM Execute bot backend
+"%PYTHON_EXE%" main.py
 
-echo.
-echo  [STOPPED] Bot has been stopped.
+if errorlevel 1 (
+    echo.
+    echo  ============================================================
+    echo  [ERROR] Bot process exited with an error code!
+    echo  Please inspect the log messages above to identify the issue.
+    echo  ============================================================
+    echo.
+) else (
+    echo.
+    echo  [STOPPED] Bot process finished.
+)
+
 pause

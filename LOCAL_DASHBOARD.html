@@ -80,6 +80,11 @@
       color: white; box-shadow: 0 4px 20px #dc262644;
     }
     .btn-pause:hover { transform: translateY(-1px); box-shadow: 0 6px 24px #dc262666; }
+    .btn-cloud {
+      background: linear-gradient(135deg, #6366f1, #4f46e5);
+      color: white; box-shadow: 0 4px 20px #6366f144;
+    }
+    .btn-cloud:hover { transform: translateY(-1px); box-shadow: 0 6px 24px #6366f166; }
     .btn-disabled { opacity: 0.4; cursor: not-allowed; }
 
     /* ── Metric cards ── */
@@ -194,9 +199,10 @@
         <p id="ctrl-msg">Connecting to local engine...</p>
         <div id="ctrl-qid" class="qid-pill" style="display:none"></div>
       </div>
-      <div style="display:flex;gap:10px">
-        <button class="btn btn-start btn-disabled" id="btn-start" onclick="sendControl('start')">▶ TURN BOT ON</button>
-        <button class="btn btn-pause btn-disabled" id="btn-pause" onclick="sendControl('pause')">⏸ TURN BOT OFF</button>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-start btn-disabled" id="btn-start" onclick="sendControl('start')">▶ TURN LOCAL ON</button>
+        <button class="btn btn-pause btn-disabled" id="btn-pause" onclick="sendControl('pause')">⏸ TURN LOCAL OFF</button>
+        <button class="btn btn-cloud" id="btn-cloud" onclick="activateCloud()">☁️ ACTIVATE RENDER CLOUD</button>
       </div>
     </div>
 
@@ -383,6 +389,39 @@
         }
       } catch(e) {
         alert('Control command failed: ' + e.message);
+      }
+    }
+
+    async function activateCloud() {
+      const confirmSwitch = confirm("This will pause the Local PC Bot and activate the Render Cloud Bot on Vercel/Render. Continue?");
+      if (!confirmSwitch) return;
+
+      try {
+        // Try local activate_cloud endpoint first if local bot is running
+        if (connected) {
+          const res = await fetch(`${API}/activate_cloud`, {
+            method: 'POST',
+            headers: HEADERS
+          });
+          const data = await res.json();
+          alert('☁️ ' + (data.message || 'Render Cloud Bot activated!'));
+          await fetchStatus();
+        } else {
+          // Fallback: direct request to Render Cloud
+          const RENDER_API = 'https://wikibot-w509.onrender.com';
+          const res = await fetch(`${RENDER_API}/control`, {
+            method: 'POST',
+            headers: { ...HEADERS, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start' })
+          });
+          if (res.ok) {
+            alert('☁️ Render Cloud Bot ACTIVATED successfully!');
+          } else {
+            alert('Failed to reach Render Cloud. Status: HTTP ' + res.status);
+          }
+        }
+      } catch(e) {
+        alert('Error activating Render Cloud: ' + e.message);
       }
     }
 

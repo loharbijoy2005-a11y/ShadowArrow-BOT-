@@ -766,6 +766,25 @@ def _consumer_thread() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # §13  STARTUP — authenticate + launch threads
 # ══════════════════════════════════════════════════════════════════════════════
+def _pause_render_cloud() -> None:
+    """If running locally, automatically pause Render Cloud bot so both don't overlap."""
+    render_url = os.getenv("RENDER_BACKEND_URL", "https://wikibot-w509.onrender.com")
+    try:
+        logger.info(f"🔄 Auto-pausing Render Cloud bot ({render_url})...")
+        resp = requests.post(
+            f"{render_url}/control",
+            headers={"X-Bot-Token": SECRET_KEY},
+            json={"action": "pause"},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            logger.info("✅ RENDER CLOUD BOT SUCCESSFULLY PAUSED! Local PC bot is now primary.")
+        else:
+            logger.warning(f"⚠️ Render pause HTTP response: {resp.status_code}")
+    except Exception as exc:
+        logger.warning(f"⚠️ Could not contact Render Cloud to pause: {exc}")
+
+
 def _startup() -> None:
     """Called once at application boot. Sets up session, authenticates, starts threads."""
     global _session
@@ -783,6 +802,10 @@ def _startup() -> None:
             _bot_state["status_message"] = "ERROR: Authentication failed"
         return
 
+    # If local, pause Render cloud bot automatically so they don't run at the same time
+    if IS_LOCAL:
+        threading.Thread(target=_pause_render_cloud, name="RenderPauser", daemon=True).start()
+
     # Producer — daemon so it dies with the main process
     threading.Thread(
         target=_producer_thread,
@@ -790,8 +813,8 @@ def _startup() -> None:
         daemon=True,
     ).start()
 
-    # Consumer threads — 5 on local, 1 on Render Free
-    num_consumers = 5 if IS_LOCAL else 1
+    # Consumer thread — 1 consumer @ 1.0s = 60 edits/min (WMF 1 edit/sec strict limit)
+    num_consumers = 1
     for i in range(num_consumers):
         threading.Thread(
             target=_consumer_thread,
@@ -799,7 +822,7 @@ def _startup() -> None:
             daemon=True,
         ).start()
 
-    mode_str = f"LOCAL ({num_consumers} consumers, ~{num_consumers*60} edits/min)" if IS_LOCAL else "RENDER (1 consumer, ~60 edits/min)"
+    mode_str = f"LOCAL PC MODE (60 edits/min max)" if IS_LOCAL else "RENDER CLOUD MODE (60 edits/min max)"
     start_str = "AUTO-STARTED (editing now!)" if AUTO_START else "PAUSED (start from dashboard)"
     logger.info(f"WikiBot v3 ready | Mode: {mode_str} | Status: {start_str}")
 
@@ -904,6 +927,40 @@ def control_bot(req: ControlRequest, x_bot_token: Optional[str] = Header(None)):
             "is_active": _bot_state["is_active"],
             "message":   _bot_state["status_message"],
         }
+
+
+@app.post("/activate_cloud", tags=["Control"])
+def activate_cloud(x_bot_token: Optional[str] = Header(None)):
+    """
+    Pauses local PC bot and automatically turns ON Render Cloud bot.
+    """
+    _verify(x_bot_token)
+    with _state_lock:
+        _bot_state["is_active"] = False
+        _bot_state["status_message"] = "Paused (Switched to Render Cloud Mode)"
+
+    render_url = os.getenv("RENDER_BACKEND_URL", "https://wikibot-w509.onrender.com")
+    cloud_msg = "Unknown"
+    try:
+        resp = requests.post(
+            f"{render_url}/control",
+            headers={"X-Bot-Token": SECRET_KEY},
+            json={"action": "start"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            cloud_msg = "Render Cloud bot is now ACTIVATED & Editing!"
+        else:
+            cloud_msg = f"HTTP {resp.status_code} from Render"
+    except Exception as exc:
+        cloud_msg = f"Failed to contact Render: {exc}"
+
+    return {
+        "success": True,
+        "is_active": False,
+        "cloud_status": cloud_msg,
+        "message": f"Local bot paused. Cloud Status: {cloud_msg}",
+    }
 
 
 @app.get("/edits", tags=["Telemetry"])
